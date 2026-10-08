@@ -1,6 +1,7 @@
 package ua;
 
 import java.io.IOException;
+
 import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
@@ -11,6 +12,8 @@ import java.util.UUID;
 import common.FindMyIPv4;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.SDPMessage;
+
+import mensajesSIP.RegisterMessage;
 
 public class UaUserLayer {
 	private static final int IDLE = 0;
@@ -24,15 +27,20 @@ public class UaUserLayer {
 	private String myAddress = FindMyIPv4.findMyIPv4Address().getHostAddress();
 	private int rtpPort;
 	private int listenPort;
+	
+	private String sipUser;
+	private int registerTime;
 
 	private Process vitextClient = null;
 	private Process vitextServer = null;
 
-	public UaUserLayer(int listenPort, String proxyAddress, int proxyPort)
+	public UaUserLayer(String sipUser, int listenPort, String proxyAddress,int proxyPort, int registerTime)
 			throws SocketException, UnknownHostException {
 		this.transactionLayer = new UaTransactionLayer(listenPort, proxyAddress, proxyPort, this);
 		this.listenPort = listenPort;
 		this.rtpPort = listenPort + 1;
+		this.sipUser = sipUser;
+		this.registerTime = registerTime;
 	}
 
 	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
@@ -44,6 +52,33 @@ public class UaUserLayer {
 		transactionLayer.startListeningNetwork();
 	}
 
+	public void register() throws IOException {
+
+	    RegisterMessage registerMessage = new RegisterMessage();
+
+	    registerMessage.setDestination("sip:SMA");
+	    registerMessage.setVias(new ArrayList<String>(
+	            Arrays.asList(myAddress + ":" + listenPort)));
+	    registerMessage.setMaxForwards(70);
+
+	    registerMessage.setToUri("sip:" + sipUser);
+	    registerMessage.setFromUri("sip:" + sipUser);
+
+	    registerMessage.setCallId(UUID.randomUUID().toString());
+	    registerMessage.setcSeqNumber("1");
+	    registerMessage.setcSeqStr("REGISTER");
+
+	    registerMessage.setContact(myAddress + ":" + listenPort);
+
+	    registerMessage.setExpires(String.valueOf(registerTime));
+	    registerMessage.setContentLength(0);
+
+	    System.out.println("Enviando REGISTER...");
+	    System.out.println(registerMessage.toStringMessage());
+
+	    transactionLayer.register(registerMessage);
+	}
+	
 	public void startListeningKeyboard() {
 		try (Scanner scanner = new Scanner(System.in)) {
 			while (true) {

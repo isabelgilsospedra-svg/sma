@@ -5,6 +5,7 @@ import java.net.SocketException;
 
 import mensajesSIP.InviteMessage;
 import mensajesSIP.SIPMessage;
+import mensajesSIP.RegisterMessage;
 
 public class UaTransactionLayer {
 	private static final int IDLE = 0;
@@ -41,5 +42,9 @@ public class UaTransactionLayer {
 
 	public void call(InviteMessage inviteMessage) throws IOException {
 		transportLayer.sendToProxy(inviteMessage);
+	}
+	
+	public void register(RegisterMessage registerMessage) throws IOException {
+	    transportLayer.sendToProxy(registerMessage);
 	}
 }
