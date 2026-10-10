@@ -5,4 +5,7 @@
 	<user id="sip:fsedano@it.uc3m.es">
 		<Servlet-class name="example.sip.JaviSIPServlet" />
 	</user>
+	<user id="sip:alice@SMA" />
+	<user id="sip:bob@SMA" />
+	<user id="sip:carol@SMA" />
 </users>
