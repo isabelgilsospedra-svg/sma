@@ -70,7 +70,9 @@ public class UaUserLayer {
 	public void onRegisterNotFound(NotFoundMessage notFoundMessage) {
 		registered = false;
 		System.out.println("Registro rechazado (404): " + sipUser + " no es un usuario permitido");
-		System.out.println("Cierra el UA y arrancalo con un usuario de users.xml");
+		// Enunciado: "Si recibe un 404 la aplicacion de agente de usuario finalizara."
+		System.out.println("Finalizando el UA");
+		System.exit(1);
 	}
 
 	public void startListeningNetwork() {
