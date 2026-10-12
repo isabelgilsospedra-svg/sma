@@ -63,11 +63,13 @@ public class UaUserLayer {
 		registerExpiresAt = System.currentTimeMillis() + expires * 1000L;
 		registered = true;
 		System.out.println("Registrado en el proxy como " + sipUser + " durante " + expires + " s");
+		prompt(); // ya se pueden usar los comandos: se muestra el menu
 	}
 
 	public void onRegisterNotFound(NotFoundMessage notFoundMessage) {
 		registered = false;
 		System.out.println("Registro rechazado (404): " + sipUser + " no es un usuario permitido");
+		System.out.println("Cierra el UA y arrancalo con un usuario de users.xml");
 	}
 
 	public void startListeningNetwork() {
@@ -118,6 +120,11 @@ public class UaUserLayer {
 
 	private void prompt() {
 		System.out.println("");
+		if (!registered) {
+			System.out.println("Esperando el registro en el proxy: los comandos se activan al recibir el 200 OK");
+			System.out.print("> ");
+			return;
+		}
 		switch (state) {
 			case IDLE:
 				promptIdle();
@@ -133,6 +140,10 @@ public class UaUserLayer {
 	}
 
 	private void command(String line) throws IOException {
+		if (!registered) {
+			System.out.println("Comando ignorado: el UA no esta registrado en el proxy");
+			return;
+		}
 		if (line.startsWith("INVITE")) {
 			commandInvite(line);
 		} else {
