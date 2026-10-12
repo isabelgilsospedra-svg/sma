@@ -24,10 +24,10 @@ public class UaTransactionLayer {
 	/** Temporizador de reenvio del REGISTER; null si no hay ninguno pendiente. */
 	private Timer registerTimer = null;
 
-	public UaTransactionLayer(int listenPort, String proxyAddress, int proxyPort, UaUserLayer userLayer)
-			throws SocketException {
+	public UaTransactionLayer(int listenPort, String proxyAddress, int proxyPort, boolean debug,
+							  UaUserLayer userLayer) throws SocketException {
 		this.userLayer = userLayer;
-		this.transportLayer = new UaTransportLayer(listenPort, proxyAddress, proxyPort, this);
+		this.transportLayer = new UaTransportLayer(listenPort, proxyAddress, proxyPort, debug, this);
 	}
 
 	public void onMessageReceived(SIPMessage sipMessage) throws IOException {

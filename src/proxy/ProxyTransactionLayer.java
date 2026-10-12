@@ -15,9 +15,9 @@ public class ProxyTransactionLayer {
 	private ProxyUserLayer userLayer;
 	private ProxyTransportLayer transportLayer;
 
-	public ProxyTransactionLayer(int listenPort, ProxyUserLayer userLayer) throws SocketException {
+	public ProxyTransactionLayer(int listenPort, boolean debug, ProxyUserLayer userLayer) throws SocketException {
 		this.userLayer = userLayer;
-		this.transportLayer = new ProxyTransportLayer(listenPort, this);
+		this.transportLayer = new ProxyTransportLayer(listenPort, debug, this);
 	}
 
 	public void onMessageReceived(SIPMessage sipMessage) throws IOException {

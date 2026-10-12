@@ -41,9 +41,10 @@ public class UaUserLayer {
 	private Process vitextClient = null;
 	private Process vitextServer = null;
 
-	public UaUserLayer(String sipUser, int listenPort, String proxyAddress,int proxyPort, int registerTime)
+	public UaUserLayer(String sipUser, int listenPort, String proxyAddress, int proxyPort, boolean debug,
+					   int registerTime)
 			throws SocketException, UnknownHostException {
-		this.transactionLayer = new UaTransactionLayer(listenPort, proxyAddress, proxyPort, this);
+		this.transactionLayer = new UaTransactionLayer(listenPort, proxyAddress, proxyPort, debug, this);
 		this.listenPort = listenPort;
 		this.rtpPort = listenPort + 1;
 		this.sipUser = sipUser;
@@ -96,9 +97,6 @@ public class UaUserLayer {
 
 		registerMessage.setExpires(String.valueOf(registerTime));
 		registerMessage.setContentLength(0);
-
-		System.out.println("Enviando REGISTER...");
-		System.out.println(registerMessage.toStringMessage());
 
 		transactionLayer.register(registerMessage);
 	}

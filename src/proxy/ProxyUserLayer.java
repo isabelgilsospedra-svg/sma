@@ -17,6 +17,9 @@ import sipServlet.UsersServletReader;
 public class ProxyUserLayer {
 	private ProxyTransactionLayer transactionLayer;
 
+	/** Si es true, el proxy se queda en la llamada (Record-Route). Se usa en el bloque 3. */
+	private final boolean looseRouting;
+
 	/** Usuarios permitidos (URIs leidas de users.xml), p. ej. "sip:alice@SMA". */
 	private final Set<String> allowedUsers = new HashSet<String>();
 
@@ -34,8 +37,9 @@ public class ProxyUserLayer {
 		}
 	}
 
-	public ProxyUserLayer(int listenPort) throws Exception {
-		this.transactionLayer = new ProxyTransactionLayer(listenPort, this);
+	public ProxyUserLayer(int listenPort, boolean looseRouting, boolean debug) throws Exception {
+		this.looseRouting = looseRouting;
+		this.transactionLayer = new ProxyTransactionLayer(listenPort, debug, this);
 		loadAllowedUsers();
 	}
 

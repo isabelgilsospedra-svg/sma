@@ -16,10 +16,13 @@ public class UaTransportLayer {
 	private int proxyPort;
 	private DatagramSocket socket;
 	private UaTransactionLayer transactionLayer;
+	/** true: traza con todas las cabeceras; false: solo la primera linea. */
+	private boolean debug;
 
-	public UaTransportLayer(int listenPort, String proxyAddress, int proxyPort, UaTransactionLayer transactionLayer)
-			throws SocketException {
+	public UaTransportLayer(int listenPort, String proxyAddress, int proxyPort, boolean debug,
+							UaTransactionLayer transactionLayer) throws SocketException {
 		this.transactionLayer = transactionLayer;
+		this.debug = debug;
 		this.listenPort = listenPort;
 		this.proxyAddress = proxyAddress;
 		this.proxyPort = proxyPort;
@@ -27,11 +30,27 @@ public class UaTransportLayer {
 	}
 
 	public void sendToProxy(SIPMessage sipMessage) throws IOException {
-		send(sipMessage.toStringMessage().getBytes(), this.proxyAddress, this.proxyPort);
+		send(sipMessage, this.proxyAddress, this.proxyPort);
 	}
 
 	public void send(SIPMessage sipMessage, String address, int port) throws IOException {
-		send(sipMessage.toStringMessage().getBytes(), address, port);
+		String msg = sipMessage.toStringMessage();
+		trace("-->", "a " + address + ":" + port, msg);
+		send(msg.getBytes(), address, port);
+	}
+
+	/**
+	 * Todos los mensajes enviados y recibidos pasan por aqui. La flecha indica
+	 * el sentido: --> enviado, <-- recibido.
+	 */
+	private void trace(String arrow, String peer, String msg) {
+		if (debug) {
+			System.out.println(arrow + " (" + peer + ")");
+			System.out.println(msg.trim());
+			System.out.println();
+		} else {
+			System.out.println(arrow + " " + msg.split("\n", 2)[0].trim() + "  (" + peer + ")");
+		}
 	}
 
 	private void send(byte[] bytes, String address, int port) throws IOException {
@@ -48,6 +67,7 @@ public class UaTransportLayer {
 				DatagramPacket packet = new DatagramPacket(buf, buf.length);
 				socket.receive(packet);
 				String msg = new String(packet.getData(), 0, packet.getLength());
+				trace("<--", "de " + packet.getAddress().getHostAddress() + ":" + packet.getPort(), msg);
 				SIPMessage sipMessage = SIPMessage.parseMessage(msg);
 				transactionLayer.onMessageReceived(sipMessage);
 			} catch (Exception e) {

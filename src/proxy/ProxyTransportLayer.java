@@ -14,15 +14,35 @@ public class ProxyTransportLayer {
 	private int listenPort;
 	private DatagramSocket socket;
 	private ProxyTransactionLayer transactionLayer;
+	/** true: traza con todas las cabeceras; false: solo la primera linea. */
+	private boolean debug;
 
-	public ProxyTransportLayer(int listenPort, ProxyTransactionLayer transactionLayer) throws SocketException {
+	public ProxyTransportLayer(int listenPort, boolean debug, ProxyTransactionLayer transactionLayer)
+			throws SocketException {
 		this.transactionLayer = transactionLayer;
+		this.debug = debug;
 		this.listenPort = listenPort;
 		this.socket = new DatagramSocket(listenPort);
 	}
 
 	public void send(SIPMessage sipMessage, String address, int port) throws IOException {
-		send(sipMessage.toStringMessage().getBytes(), address, port);
+		String msg = sipMessage.toStringMessage();
+		trace("-->", "a " + address + ":" + port, msg);
+		send(msg.getBytes(), address, port);
+	}
+
+	/**
+	 * Todos los mensajes enviados y recibidos pasan por aqui. La flecha indica
+	 * el sentido: --> enviado, <-- recibido.
+	 */
+	private void trace(String arrow, String peer, String msg) {
+		if (debug) {
+			System.out.println(arrow + " (" + peer + ")");
+			System.out.println(msg.trim());
+			System.out.println();
+		} else {
+			System.out.println(arrow + " " + msg.split("\n", 2)[0].trim() + "  (" + peer + ")");
+		}
 	}
 
 	private void send(byte[] bytes, String address, int port) throws IOException {
@@ -39,6 +59,7 @@ public class ProxyTransportLayer {
 				DatagramPacket packet = new DatagramPacket(buf, buf.length);
 				socket.receive(packet);
 				String msg = new String(packet.getData(), 0, packet.getLength());
+				trace("<--", "de " + packet.getAddress().getHostAddress() + ":" + packet.getPort(), msg);
 				SIPMessage sipMessage = SIPMessage.parseMessage(msg);
 				transactionLayer.onMessageReceived(sipMessage);
 			} catch (Exception e) {
