@@ -11,6 +11,8 @@ import java.util.UUID;
 
 import common.FindMyIPv4;
 import mensajesSIP.InviteMessage;
+import mensajesSIP.NotFoundMessage;
+import mensajesSIP.OKMessage;
 import mensajesSIP.SDPMessage;
 
 import mensajesSIP.RegisterMessage;
@@ -27,9 +29,14 @@ public class UaUserLayer {
 	private String myAddress = FindMyIPv4.findMyIPv4Address().getHostAddress();
 	private int rtpPort;
 	private int listenPort;
-	
+
 	private String sipUser;
 	private int registerTime;
+
+	/** true desde que el proxy acepta el REGISTER con un 200 OK. */
+	private volatile boolean registered = false;
+	/** Instante (ms) en que caduca el registro segun el Expires del 200 OK. */
+	private volatile long registerExpiresAt = 0;
 
 	private Process vitextClient = null;
 	private Process vitextServer = null;
@@ -48,37 +55,52 @@ public class UaUserLayer {
 		runVitextServer();
 	}
 
+	public void onRegisterOk(OKMessage okMessage) {
+		int expires = registerTime;
+		if (okMessage.getExpires() != null) {
+			expires = Integer.parseInt(okMessage.getExpires());
+		}
+		registerExpiresAt = System.currentTimeMillis() + expires * 1000L;
+		registered = true;
+		System.out.println("Registrado en el proxy como " + sipUser + " durante " + expires + " s");
+	}
+
+	public void onRegisterNotFound(NotFoundMessage notFoundMessage) {
+		registered = false;
+		System.out.println("Registro rechazado (404): " + sipUser + " no es un usuario permitido");
+	}
+
 	public void startListeningNetwork() {
 		transactionLayer.startListeningNetwork();
 	}
 
 	public void register() throws IOException {
 
-	    RegisterMessage registerMessage = new RegisterMessage();
+		RegisterMessage registerMessage = new RegisterMessage();
 
-	    registerMessage.setDestination("sip:SMA");
-	    registerMessage.setVias(new ArrayList<String>(
-	            Arrays.asList(myAddress + ":" + listenPort)));
-	    registerMessage.setMaxForwards(70);
+		registerMessage.setDestination("sip:SMA");
+		registerMessage.setVias(new ArrayList<String>(
+				Arrays.asList(myAddress + ":" + listenPort)));
+		registerMessage.setMaxForwards(70);
 
-	    registerMessage.setToUri("sip:" + sipUser);
-	    registerMessage.setFromUri("sip:" + sipUser);
+		registerMessage.setToUri("sip:" + sipUser);
+		registerMessage.setFromUri("sip:" + sipUser);
 
-	    registerMessage.setCallId(UUID.randomUUID().toString());
-	    registerMessage.setcSeqNumber("1");
-	    registerMessage.setcSeqStr("REGISTER");
+		registerMessage.setCallId(UUID.randomUUID().toString());
+		registerMessage.setcSeqNumber("1");
+		registerMessage.setcSeqStr("REGISTER");
 
-	    registerMessage.setContact(myAddress + ":" + listenPort);
+		registerMessage.setContact(myAddress + ":" + listenPort);
 
-	    registerMessage.setExpires(String.valueOf(registerTime));
-	    registerMessage.setContentLength(0);
+		registerMessage.setExpires(String.valueOf(registerTime));
+		registerMessage.setContentLength(0);
 
-	    System.out.println("Enviando REGISTER...");
-	    System.out.println(registerMessage.toStringMessage());
+		System.out.println("Enviando REGISTER...");
+		System.out.println(registerMessage.toStringMessage());
 
-	    transactionLayer.register(registerMessage);
+		transactionLayer.register(registerMessage);
 	}
-	
+
 	public void startListeningKeyboard() {
 		try (Scanner scanner = new Scanner(System.in)) {
 			while (true) {
@@ -97,11 +119,11 @@ public class UaUserLayer {
 	private void prompt() {
 		System.out.println("");
 		switch (state) {
-		case IDLE:
-			promptIdle();
-			break;
-		default:
-			throw new IllegalStateException("Unexpected state: " + state);
+			case IDLE:
+				promptIdle();
+				break;
+			default:
+				throw new IllegalStateException("Unexpected state: " + state);
 		}
 		System.out.print("> ");
 	}
@@ -121,7 +143,7 @@ public class UaUserLayer {
 	private void commandInvite(String line) throws IOException {
 		stopVitextServer();
 		stopVitextClient();
-		
+
 		System.out.println("Inviting...");
 
 		runVitextClient();
