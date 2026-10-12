@@ -11,6 +11,12 @@ public class UA {
 		System.out.println("UA launching with args: " + String.join(", ", args));
 
 		String sipUser = args[0];
+		// Mismo formato que acepta SIPMessage.parseTo: nombre@dominio (letras, numeros y _; el dominio puede llevar puntos).
+		if (!sipUser.matches("\\w+@[\\w\\.]+")) {
+			System.err.println("El usuario SIP debe tener formato nombre@dominio (por ejemplo alice@SMA); recibido: " + sipUser);
+			System.err.println(USAGE);
+			System.exit(1);
+		}
 		int listenPort = Integer.parseInt(args[1]);
 		String proxyAddress = args[2];
 		int proxyPort = Integer.parseInt(args[3]);
