@@ -74,7 +74,12 @@ public class ProxyUserLayer {
 		// put() sustituye la entrada anterior si el usuario ya estaba registrado.
 		registry.put(user, new Registration(registerMessage.getContact(), expiresAt));
 		System.out.println("Registrado " + user + " en " + registerMessage.getContact() + " durante " + expires + " s");
-
+		
+		/*prueba
+		System.out.println("Contacto guardado: " + registry.get(user).contact);
+		System.out.println("Numero de registros en la tabla: " + registry.size());
+		*/
+		
 		transactionLayer.sendResponse(buildOk(registerMessage), originAddress, originPort);
 	}
 

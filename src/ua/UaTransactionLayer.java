@@ -27,6 +27,7 @@ public class UaTransactionLayer {
 
 	/** Temporizador de reenvio del REGISTER; null si no hay ninguno pendiente. */
 	private Timer registerTimer = null;
+	private RegisterMessage pendingRegister = null; // guarda el mensaje cuyo 200  OK o 404 estamos esperando
 
 	/** Estado de la transaccion INVITE en curso (IDLE si no hay ninguna). */
 	private InviteState inviteState = InviteState.IDLE;
@@ -43,13 +44,19 @@ public class UaTransactionLayer {
 
 	public synchronized void onMessageReceived(SIPMessage sipMessage) throws IOException {
 		if (sipMessage instanceof OKMessage
-				&& isRegister(((OKMessage) sipMessage).getcSeqStr())) {
-			stopRegisterTimer();
-			userLayer.onRegisterOk((OKMessage) sipMessage);
+		        && isRegister(((OKMessage) sipMessage).getcSeqStr())) {
+		    if (finishRegister(
+		            ((OKMessage) sipMessage).getCallId(),
+		            ((OKMessage) sipMessage).getcSeqNumber())) {
+		        userLayer.onRegisterOk((OKMessage) sipMessage);
+		    }
 		} else if (sipMessage instanceof NotFoundMessage
-				&& isRegister(((NotFoundMessage) sipMessage).getcSeqStr())) {
-			stopRegisterTimer();
-			userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
+		        && isRegister(((NotFoundMessage) sipMessage).getcSeqStr())) {
+		    if (finishRegister(
+		            ((NotFoundMessage) sipMessage).getCallId(),
+		            ((NotFoundMessage) sipMessage).getcSeqNumber())) {
+		        userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
+		    }
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {
@@ -60,6 +67,7 @@ public class UaTransactionLayer {
 			System.err.println("Unexpected message, throwing away");
 		}
 	}
+	
 	/** Llamado: llega un INVITE. Si no hay transaccion en curso, empieza una como llamado. */
 	private void onInvite(InviteMessage inviteMessage) throws IOException {
 		if (inviteState == InviteState.IDLE) {
@@ -102,6 +110,25 @@ public class UaTransactionLayer {
 	private boolean isRegister(String cSeqMethod) {
 		return "REGISTER".equals(cSeqMethod);
 	}
+	
+	private synchronized boolean finishRegister(String callId, String cSeq) {
+
+	    if (pendingRegister == null) {
+	        return false;
+	    }
+
+	    if (!pendingRegister.getCallId().equals(callId)
+	            || !pendingRegister.getcSeqNumber().equals(cSeq)) {
+
+	        System.out.println("Respuesta REGISTER no coincidente");
+	        return false;
+	    }
+
+	    stopRegisterTimer();
+	    pendingRegister = null;
+
+	    return true;
+	}
 
 	public void startListeningNetwork() {
 		transportLayer.startListening();
@@ -116,25 +143,38 @@ public class UaTransactionLayer {
 	}
 
 	/**
-	 * Envia el REGISTER y lo reenvia cada 2 s hasta que llegue una respuesta
-	 * (200 o 404). El reenvio es el mismo mensaje: mismo Call-ID y mismo CSeq.
+	 * Envia el REGISTER y lo reenvia cada 2 s hasta recibir
+	 * una respuesta 200 OK o 404.
 	 */
 	public synchronized void register(RegisterMessage registerMessage) throws IOException {
-		stopRegisterTimer();
-		transportLayer.sendToProxy(registerMessage);
 
-		registerTimer = new Timer("register-retry", true);
-		registerTimer.schedule(new TimerTask() {
-			@Override
-			public void run() {
-				try {
-					System.out.println("Sin respuesta del proxy: reenviando REGISTER");
-					transportLayer.sendToProxy(registerMessage);
-				} catch (IOException e) {
-					System.err.println("Error reenviando REGISTER: " + e.getMessage());
-				}
-			}
-		}, REGISTER_RETRY_MS, REGISTER_RETRY_MS);
+	    stopRegisterTimer();
+
+	    pendingRegister = registerMessage; // guardamos el mensaje que estamos esperando confirmar
+
+	    registerTimer = new Timer("register-retry", true);
+
+	    registerTimer.schedule(new TimerTask() {
+	        @Override
+	        public void run() {
+
+	        	/* aquí evitamos que el temporizador compruebe que hay un REGISTER pendiente y lo 
+	        	 * envíe a otro hilo cuando se de por terminado
+	        	 */
+	            synchronized (UaTransactionLayer.this) {
+
+	                if (pendingRegister == null) {
+	                    return;
+	                }
+
+	                try {
+	                    transportLayer.sendToProxy(pendingRegister);
+	                } catch (IOException e) {
+	                    System.err.println("Error enviando REGISTER: " + e.getMessage());
+	                }
+	            }
+	        }
+	    }, 0, REGISTER_RETRY_MS); // el primer envío realiza el temporizador inmediatamente y los siguientes se programan cada 2 segundos
 	}
 
 	private synchronized void stopRegisterTimer() {
