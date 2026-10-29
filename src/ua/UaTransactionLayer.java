@@ -36,6 +36,14 @@ public class UaTransactionLayer {
 	/** Call-ID de la transaccion INVITE en curso: los mensajes de otro Call-ID no son de esta llamada. */
 	private String inviteCallId = null;
 
+	/** Tiempo en Completed antes de pasar a Terminated (ms). */
+	private static final long COMPLETED_MS = 1000;
+	/** Llamado: a donde se envian las respuestas al INVITE (la primera Via del INVITE: el proxy). */
+	private String responseAddress = null;
+	private int responsePort = 0;
+	/** Temporizador de 1 s del estado Completed. */
+	private Timer completedTimer = null;
+
 	public UaTransactionLayer(int listenPort, String proxyAddress, int proxyPort, boolean debug,
 							  UaUserLayer userLayer) throws SocketException {
 		this.userLayer = userLayer;
@@ -86,12 +94,16 @@ public class UaTransactionLayer {
 			System.err.println("Unexpected message, throwing away");
 		}
 	}
-	
+
 	/** Llamado: llega un INVITE. Si no hay transaccion en curso, empieza una como llamado. */
 	private void onInvite(InviteMessage inviteMessage) throws IOException {
 		if (inviteState == InviteState.IDLE) {
 			caller = false;
 			inviteCallId = inviteMessage.getCallId();
+			// Las respuestas vuelven por donde vino el INVITE: la primera Via.
+			String[] via = inviteMessage.getVias().get(0).split(":");
+			responseAddress = via[0];
+			responsePort = Integer.parseInt(via[1]);
 			// Diagrama del llamado: INVITE -> Proceeding, pass INV to TU (el UA llamado no envia 100).
 			setInviteState(InviteState.PROCEEDING);
 			userLayer.onInviteReceived(inviteMessage);
@@ -117,7 +129,63 @@ public class UaTransactionLayer {
 			userLayer.onRinging();
 		}
 	}
+	/** Llamado: el usuario (TU) envia el 180 Ringing. La transaccion sigue en Proceeding. */
+	public synchronized boolean sendRinging(RingingMessage ringing) throws IOException {
+		if (caller || inviteState != InviteState.PROCEEDING) {
+			return false;
+		}
+		transportLayer.send(ringing, responseAddress, responsePort);
+		return true;
+	}
 
+	/** Llamado: "200 from TU": se envia el 200 OK y la transaccion pasa a Terminated. */
+	public synchronized boolean sendOk(OKMessage ok) throws IOException {
+		if (caller || inviteState != InviteState.PROCEEDING) {
+			return false;
+		}
+		transportLayer.send(ok, responseAddress, responsePort);
+		setInviteState(InviteState.TERMINATED);
+		endInviteTransaction();
+		return true;
+	}
+
+	/**
+	 * Llamado: "404/408/486/503 from TU": se envia el error y la transaccion pasa
+	 * a Completed; a 1 s, Terminated. La espera del ACK y el reenvio del error
+	 * cada 200 ms se anaden en el paso 4.
+	 */
+	public synchronized boolean sendError(SIPMessage error) throws IOException {
+		if (caller || inviteState != InviteState.PROCEEDING) {
+			return false;
+		}
+		transportLayer.send(error, responseAddress, responsePort);
+		setInviteState(InviteState.COMPLETED);
+		startCompletedTimer();
+		return true;
+	}
+
+	private void startCompletedTimer() {
+		completedTimer = new Timer("ua-completed", true);
+		completedTimer.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				synchronized (UaTransactionLayer.this) {
+					setInviteState(InviteState.TERMINATED);
+					endInviteTransaction();
+				}
+			}
+		}, COMPLETED_MS);
+	}
+
+	/** Fin de la transaccion INVITE: se vuelve a IDLE para poder atender otra. */
+	private void endInviteTransaction() {
+		if (completedTimer != null) {
+			completedTimer.cancel();
+			completedTimer = null;
+		}
+		inviteState = InviteState.IDLE;
+		inviteCallId = null;
+	}
 	/** Cambia el estado de la transaccion INVITE y lo muestra por pantalla (lo pide el enunciado). */
 	private void setInviteState(InviteState newState) {
 		String role = caller ? "llamante" : "llamado";

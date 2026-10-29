@@ -14,6 +14,10 @@ import mensajesSIP.SDPMessage;
 
 import mensajesSIP.RegisterMessage;
 
+import mensajesSIP.BusyHereMessage;
+import mensajesSIP.RequestTimeoutMessage;
+import mensajesSIP.RingingMessage;
+
 public class UaUserLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -22,8 +26,16 @@ public class UaUserLayer {
 	private enum CallState {
 		IDLE, // sin llamada
 		OUTGOING, // hemos enviado un INVITE y esperamos respuesta
-		INCOMING // nos ha llegado un INVITE
+		INCOMING, // nos ha llegado un INVITE
+		IN_CALL //Llamada aceptada
 	}
+
+	/** Tiempo que suena una llamada entrante antes de responder 408 (ms). */
+	private static final long ANSWER_TIMEOUT_MS = 10000;
+	/** INVITE de la llamada entrante que espera S/N; null si no hay ninguna. */
+	private volatile InviteMessage incomingInvite = null;
+	/** Temporizador de 10 s para contestar la llamada entrante. */
+	private Timer answerTimer = null;
 
 	private volatile CallState callState = CallState.IDLE;
 
@@ -96,11 +108,151 @@ public class UaUserLayer {
 	    prompt();
 	}
 
-	/** Llamado: ha llegado una llamada entrante. La respuesta (180, S/N) se implementa en el paso 2. */
 	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
+		incomingInvite = inviteMessage;
 		callState = CallState.INCOMING;
-		System.out.println("Llamada entrante de " + inviteMessage.getFromUri());
+		// Diagrama del llamado: "180 from TU if user B": el usuario hace sonar el terminal.
+		transactionLayer.sendRinging(buildRinging(inviteMessage));
+		startAnswerTimer();
+		prompt(); // muestra "Llamada entrante de ...: S para aceptar, N para rechazar"
+	}
+
+	/** Arranca los 10 s que tiene el usuario para contestar; al vencer se responde 408. */
+	private void startAnswerTimer() {
+		answerTimer = new Timer("answer-timeout", true);
+		answerTimer.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				onAnswerTimeout();
+			}
+		}, ANSWER_TIMEOUT_MS);
+	}
+
+	private void cancelAnswerTimer() {
+		if (answerTimer != null) {
+			answerTimer.cancel();
+			answerTimer = null;
+		}
+	}
+
+	/** Han pasado 10 s sin respuesta del usuario: 408 Request Timeout. */
+	private synchronized void onAnswerTimeout() {
+		if (callState != CallState.INCOMING) {
+			return; // el usuario contesto justo a tiempo
+		}
+		System.out.println("Sin respuesta en " + ANSWER_TIMEOUT_MS / 1000 + " s: se responde 408 Request Timeout");
+		try {
+			transactionLayer.sendError(buildRequestTimeout(incomingInvite));
+		} catch (IOException e) {
+			System.err.println("Error enviando 408: " + e.getMessage());
+		}
+		endIncomingCall(CallState.IDLE);
+		prompt(); // aqui no hay comando de teclado en curso: hay que volver a mostrar el menu
+	}
+
+	/** El usuario descuelga (S): 200 OK con SDP. */
+	private synchronized void acceptCall() throws IOException {
+		if (callState != CallState.INCOMING) {
+			return;
+		}
+		cancelAnswerTimer();
+		System.out.println("Llamada aceptada");
+		transactionLayer.sendOk(buildOk(incomingInvite));
 		runVitextServer();
+		endIncomingCall(CallState.IN_CALL);
+	}
+
+	/** El usuario rechaza (N): 486 Busy Here. */
+	private synchronized void rejectCall() throws IOException {
+		if (callState != CallState.INCOMING) {
+			return;
+		}
+		cancelAnswerTimer();
+		System.out.println("Llamada rechazada");
+		transactionLayer.sendError(buildBusyHere(incomingInvite));
+		endIncomingCall(CallState.IDLE);
+	}
+
+	private void endIncomingCall(CallState newState) {
+		cancelAnswerTimer();
+		incomingInvite = null;
+		callState = newState;
+	}
+
+	/*
+	 * Todas las respuestas copian del INVITE las Vias (para volver por el mismo
+	 * camino), To, From, Call-ID y CSeq (para que el llamante sepa a que peticion
+	 * responden).
+	 */
+
+	private RingingMessage buildRinging(InviteMessage invite) {
+		RingingMessage ringing = new RingingMessage();
+		ringing.setVias(new ArrayList<String>(invite.getVias()));
+		ringing.setToName(invite.getToName());
+		ringing.setToUri(invite.getToUri());
+		ringing.setFromName(invite.getFromName());
+		ringing.setFromUri(invite.getFromUri());
+		ringing.setCallId(invite.getCallId());
+		ringing.setcSeqNumber(invite.getcSeqNumber());
+		ringing.setcSeqStr(invite.getcSeqStr());
+		ringing.setContact(myAddress + ":" + listenPort);
+		ringing.setContentLength(0);
+		return ringing;
+	}
+
+	/** 200 OK al INVITE: lleva SDP con nuestra IP y puerto RTP, como el INVITE. */
+	private OKMessage buildOk(InviteMessage invite) {
+		SDPMessage sdp = buildSdp();
+		OKMessage ok = new OKMessage();
+		ok.setVias(new ArrayList<String>(invite.getVias()));
+		ok.setToName(invite.getToName());
+		ok.setToUri(invite.getToUri());
+		ok.setFromName(invite.getFromName());
+		ok.setFromUri(invite.getFromUri());
+		ok.setCallId(invite.getCallId());
+		ok.setcSeqNumber(invite.getcSeqNumber());
+		ok.setcSeqStr(invite.getcSeqStr());
+		ok.setContact(myAddress + ":" + listenPort);
+		ok.setContentLength(sdp.toStringMessage().getBytes().length);
+		ok.setSdp(sdp);
+		return ok;
+	}
+
+	private BusyHereMessage buildBusyHere(InviteMessage invite) {
+		BusyHereMessage busy = new BusyHereMessage();
+		busy.setVias(new ArrayList<String>(invite.getVias()));
+		busy.setToName(invite.getToName());
+		busy.setToUri(invite.getToUri());
+		busy.setFromName(invite.getFromName());
+		busy.setFromUri(invite.getFromUri());
+		busy.setCallId(invite.getCallId());
+		busy.setcSeqNumber(invite.getcSeqNumber());
+		busy.setcSeqStr(invite.getcSeqStr());
+		busy.setContentLength(0);
+		return busy;
+	}
+
+	private RequestTimeoutMessage buildRequestTimeout(InviteMessage invite) {
+		RequestTimeoutMessage timeout = new RequestTimeoutMessage();
+		timeout.setVias(new ArrayList<String>(invite.getVias()));
+		timeout.setToName(invite.getToName());
+		timeout.setToUri(invite.getToUri());
+		timeout.setFromName(invite.getFromName());
+		timeout.setFromUri(invite.getFromUri());
+		timeout.setCallId(invite.getCallId());
+		timeout.setcSeqNumber(invite.getcSeqNumber());
+		timeout.setcSeqStr(invite.getcSeqStr());
+		timeout.setContentLength(0);
+		return timeout;
+	}
+
+	/** SDP con nuestra IP y puerto RTP (lo usan el INVITE y el 200 OK). */
+	private SDPMessage buildSdp() {
+		SDPMessage sdp = new SDPMessage();
+		sdp.setIp(this.myAddress);
+		sdp.setPort(this.rtpPort);
+		sdp.setOptions(RTPFLOWS);
+		return sdp;
 	}
 
 	public void onRegisterOk(OKMessage okMessage) throws IOException {
@@ -189,7 +341,10 @@ public class UaUserLayer {
 					System.out.println("Llamada saliente en curso: esperando respuesta");
 					break;
 				case INCOMING:
-					System.out.println("Llamada entrante en curso");
+					System.out.println("Llamada entrante de " + incomingInvite.getFromUri() + ": S para aceptar, N para rechazar");
+					break;
+				case IN_CALL:
+					System.out.println("En llamada");
 					break;
 			}
 		}
@@ -201,46 +356,21 @@ public class UaUserLayer {
 			System.out.println("Comando ignorado: el UA no esta registrado en el proxy");
 			return;
 		}
-		if (line.toUpperCase().startsWith("INVITE")) {
+		if (callState == CallState.INCOMING) {
+			// Con una llamada entrante sonando, el teclado solo acepta S o N.
+			if (line.equalsIgnoreCase("S")) {
+				acceptCall();
+			} else if (line.equalsIgnoreCase("N")) {
+				rejectCall();
+			} else {
+				System.out.println("Responde S (aceptar) o N (rechazar)");
+			}
+		} else if (line.toUpperCase().startsWith("INVITE")) {
 			commandInvite(line);
 		} else {
 			System.out.println("Bad command");
 		}
 	}
-
-	/*private void commandInvite(String line) throws IOException {
-		stopVitextServer();
-		stopVitextClient();
-
-		System.out.println("Inviting...");
-
-		runVitextClient();
-
-		String callId = UUID.randomUUID().toString();
-
-		SDPMessage sdpMessage = new SDPMessage();
-		sdpMessage.setIp(this.myAddress);
-		sdpMessage.setPort(this.rtpPort);
-		sdpMessage.setOptions(RTPFLOWS);
-
-		InviteMessage inviteMessage = new InviteMessage();
-		inviteMessage.setDestination("sip:bob@SMA");
-		inviteMessage.setVias(new ArrayList<String>(Arrays.asList(this.myAddress + ":" + this.listenPort)));
-		inviteMessage.setMaxForwards(70);
-		inviteMessage.setToName("Bob");
-		inviteMessage.setToUri("sip:bob@SMA");
-		inviteMessage.setFromName("Alice");
-		inviteMessage.setFromUri("sip:alice@SMA");
-		inviteMessage.setCallId(callId);
-		inviteMessage.setcSeqNumber("1");
-		inviteMessage.setcSeqStr("INVITE");
-		inviteMessage.setContact(myAddress + ":" + listenPort);
-		inviteMessage.setContentType("application/sdp");
-		inviteMessage.setContentLength(sdpMessage.toStringMessage().getBytes().length);
-		inviteMessage.setSdp(sdpMessage);
-
-		transactionLayer.call(inviteMessage);
-	}*/
 
 	/** INVITE usuarioSIPDestino: el destino va sin dominio; se usa el del llamante. */
 	private void commandInvite(String line) throws IOException {
