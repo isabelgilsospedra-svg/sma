@@ -17,6 +17,8 @@ import sipServlet.UsersServletReader;
 import common.FindMyIPv4;
 import mensajesSIP.TryingMessage;
 
+import mensajesSIP.SIPMessage;
+
 public class ProxyUserLayer {
 	private ProxyTransactionLayer transactionLayer;
 
@@ -152,6 +154,20 @@ public class ProxyUserLayer {
 		String[] contactB = registrationB.contact.split(":");
 		transactionLayer.forwardInvite(inviteMessage, contactB[0], Integer.parseInt(contactB[1]));
 	}
+
+	/**
+	 * Respuesta de B que hay que hacer llegar a A: el proxy quita su propia Via
+	 * (la primera) y la envia a la siguiente, que es la de A.
+	 */
+	public void forwardResponseToA(SIPMessage response, ArrayList<String> vias) throws IOException {
+		if (!vias.get(0).equals(myVia)) {
+			System.err.println("Aviso: la primera Via (" + vias.get(0) + ") no es la del proxy (" + myVia + ")");
+		}
+		vias.remove(0);
+		String[] next = vias.get(0).split(":");
+		transactionLayer.sendToA(response, next[0], Integer.parseInt(next[1]));
+	}
+
 	/**
 	 * Devuelve el registro vigente del usuario o null si no esta registrado o si
 	 * su registro ha caducado (en ese caso se borra de la tabla).

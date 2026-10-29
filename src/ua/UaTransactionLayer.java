@@ -15,6 +15,10 @@ import common.InviteState;
 import mensajesSIP.RingingMessage;
 import mensajesSIP.TryingMessage;
 
+import mensajesSIP.BusyHereMessage;
+import mensajesSIP.RequestTimeoutMessage;
+import mensajesSIP.ServiceUnavailableMessage;
+
 public class UaTransactionLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -52,38 +56,30 @@ public class UaTransactionLayer {
 
 	public synchronized void onMessageReceived(SIPMessage sipMessage) throws IOException {
 		if (sipMessage instanceof OKMessage
-		        && isRegister(((OKMessage) sipMessage).getcSeqStr())) {
-		    if (finishRegister(
-		            ((OKMessage) sipMessage).getCallId(),
-		            ((OKMessage) sipMessage).getcSeqNumber())) {
-		        userLayer.onRegisterOk((OKMessage) sipMessage);
-		    }
+				&& isRegister(((OKMessage) sipMessage).getcSeqStr())) {
+			if (finishRegister(
+					((OKMessage) sipMessage).getCallId(),
+					((OKMessage) sipMessage).getcSeqNumber())) {
+				userLayer.onRegisterOk((OKMessage) sipMessage);
+			}
 		} else if (sipMessage instanceof NotFoundMessage
-		        && isRegister(((NotFoundMessage) sipMessage).getcSeqStr())) {
-		    if (finishRegister(
-		            ((NotFoundMessage) sipMessage).getCallId(),
-		            ((NotFoundMessage) sipMessage).getcSeqNumber())) {
-		        userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
-		    }
-		} else if (sipMessage instanceof NotFoundMessage
-		        && "INVITE".equals(((NotFoundMessage) sipMessage).getcSeqStr())) {
-
-			// comprobamos que el 404 corresppnde a INVITE, no al REGISTER. 
-		    NotFoundMessage notFound = (NotFoundMessage) sipMessage;
-
-		    if (caller && notFound.getCallId().equals(inviteCallId) // miramos el call-id
-		            && (inviteState == InviteState.CALLING
-		                || inviteState == InviteState.PROCEEDING)) { // y comprobamos que la transacción espera respuesta
-
-		        setInviteState(InviteState.COMPLETED);
-		        userLayer.onInviteNotFound();
-		        setInviteState(InviteState.TERMINATED);
-		        setInviteState(InviteState.IDLE);
-		        inviteCallId = null;
-
-		    } else {
-		        System.err.println("Unexpected message, throwing away");
-		    }
+				&& isRegister(((NotFoundMessage) sipMessage).getcSeqStr())) {
+			if (finishRegister(
+					((NotFoundMessage) sipMessage).getCallId(),
+					((NotFoundMessage) sipMessage).getcSeqNumber())) {
+				userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
+			}
+		} else if (sipMessage instanceof OKMessage) {
+			// 200 OK que no es del REGISTER: respuesta a nuestro INVITE.
+			onFinalOk((OKMessage) sipMessage);
+		} else if (sipMessage instanceof NotFoundMessage) {
+			onErrorResponse(((NotFoundMessage) sipMessage).getCallId(), 404);
+		} else if (sipMessage instanceof RequestTimeoutMessage) {
+			onErrorResponse(((RequestTimeoutMessage) sipMessage).getCallId(), 408);
+		} else if (sipMessage instanceof BusyHereMessage) {
+			onErrorResponse(((BusyHereMessage) sipMessage).getCallId(), 486);
+		} else if (sipMessage instanceof ServiceUnavailableMessage) {
+			onErrorResponse(((ServiceUnavailableMessage) sipMessage).getCallId(), 503);
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {
@@ -111,6 +107,38 @@ public class UaTransactionLayer {
 			// Ya hay una llamada en curso: se tratara en el paso 6 (486 Busy Here).
 			System.err.println("Unexpected message, throwing away");
 		}
+	}
+
+	/** Llamante: true si la respuesta es de nuestro INVITE y la transaccion aun espera respuesta final. */
+	private boolean isResponseToOurInvite(String callId) {
+		return caller && callId.equals(inviteCallId)
+				&& (inviteState == InviteState.CALLING || inviteState == InviteState.PROCEEDING);
+	}
+
+	/** Llamante: diagrama "200 / 200 to TU": Calling o Proceeding -> Terminated. El ACK del 200 lo envia el TU (paso 4). */
+	private void onFinalOk(OKMessage ok) throws IOException {
+		if (!isResponseToOurInvite(ok.getCallId())) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		setInviteState(InviteState.TERMINATED);
+		endInviteTransaction();
+		userLayer.onCallAccepted(ok);
+	}
+
+	/**
+	 * Llamante: diagrama "404/408/486/503, ACK sent, resp. to TU": Calling o
+	 * Proceeding -> Completed; a 1 s, Terminated. El envio del ACK (y su
+	 * reenvio si el error llega repetido) se anade en el paso 4.
+	 */
+	private void onErrorResponse(String callId, int code) {
+		if (!isResponseToOurInvite(callId)) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		setInviteState(InviteState.COMPLETED);
+		userLayer.onCallRejected(code);
+		startCompletedTimer();
 	}
 
 	/** Llamante: llega un 100 Trying o un 180 Ringing de nuestro INVITE. */

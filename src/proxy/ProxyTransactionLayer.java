@@ -12,6 +12,13 @@ import java.util.Timer;
 import java.util.TimerTask;
 import common.InviteState;
 
+import java.util.ArrayList;
+
+import mensajesSIP.BusyHereMessage;
+import mensajesSIP.OKMessage;
+import mensajesSIP.RequestTimeoutMessage;
+import mensajesSIP.RingingMessage;
+
 public class ProxyTransactionLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -48,9 +55,60 @@ public class ProxyTransactionLayer {
 				// Ya hay un INVITE en proceso: se tratara en el paso 6 (503 Service Unavailable).
 				System.err.println("Unexpected message, throwing away");
 			}
+		} else if (sipMessage instanceof RingingMessage) {
+			RingingMessage ringing = (RingingMessage) sipMessage;
+			onResponseFromB(ringing, ringing.getCallId(), ringing.getVias(), 180);
+		} else if (sipMessage instanceof OKMessage && "INVITE".equals(((OKMessage) sipMessage).getcSeqStr())) {
+			OKMessage ok = (OKMessage) sipMessage;
+			onResponseFromB(ok, ok.getCallId(), ok.getVias(), 200);
+		} else if (sipMessage instanceof BusyHereMessage) {
+			BusyHereMessage busy = (BusyHereMessage) sipMessage;
+			onResponseFromB(busy, busy.getCallId(), busy.getVias(), 486);
+		} else if (sipMessage instanceof RequestTimeoutMessage) {
+			RequestTimeoutMessage timeout = (RequestTimeoutMessage) sipMessage;
+			onResponseFromB(timeout, timeout.getCallId(), timeout.getVias(), 408);
 		} else {
 			System.err.println("Unexpected message, throwing away");
 		}
+	}
+
+	/**
+	 * Respuesta de B al INVITE reenviado. Cambia el estado de las dos
+	 * transacciones y la respuesta se reenvia a A (la capa de usuario quita la
+	 * Via del proxy y la envia a la Via siguiente).
+	 *  - 180: con B, Calling -> Proceeding; con A sigue en Proceeding.
+	 *  - 200: con B y con A, -> Terminated. Sin loose routing el proxy sale de la llamada.
+	 *  - 486/408: con B y con A, -> Completed; a 1 s, Terminated. Los ACK se anaden en el paso 4.
+	 */
+	private void onResponseFromB(SIPMessage response, String callId, ArrayList<String> vias, int code)
+			throws IOException {
+		boolean ours = callId.equals(inviteCallId)
+				&& (stateB == InviteState.CALLING || stateB == InviteState.PROCEEDING);
+		if (!ours) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		if (code < 200) {
+			if (stateB == InviteState.CALLING) {
+				setStateB(InviteState.PROCEEDING);
+			}
+			userLayer.forwardResponseToA(response, vias);
+		} else if (code == 200) {
+			setStateB(InviteState.TERMINATED);
+			userLayer.forwardResponseToA(response, vias);
+			setStateA(InviteState.TERMINATED);
+			endInvite();
+		} else {
+			setStateB(InviteState.COMPLETED);
+			userLayer.forwardResponseToA(response, vias);
+			setStateA(InviteState.COMPLETED);
+			startCompletedTimerA();
+		}
+	}
+
+	/** Envia a A una respuesta que llego de B (ya sin la Via del proxy). */
+	public void sendToA(SIPMessage response, String addressA, int portA) throws IOException {
+		transportLayer.send(response, addressA, portA);
 	}
 
 	public void sendResponse(SIPMessage response, String address, int port) throws IOException {
@@ -96,6 +154,9 @@ public class ProxyTransactionLayer {
 			@Override
 			public void run() {
 				synchronized (ProxyTransactionLayer.this) {
+					if (stateB == InviteState.COMPLETED) {
+						setStateB(InviteState.TERMINATED);
+					}
 					setStateA(InviteState.TERMINATED);
 					endInvite();
 				}

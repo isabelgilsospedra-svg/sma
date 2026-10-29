@@ -99,13 +99,37 @@ public class UaUserLayer {
 	public void onRinging() {
 		System.out.println("El destino esta sonando...");
 	}
-	
-	/** El INVITE ha sido rechazado porque el destino no esta registrado. */
-	public void onInviteNotFound() {
-	    System.out.println("Llamada rechazada (404): el destino no esta registrado");
-	    callState = CallState.IDLE;
-	    stopVitextClient();
-	    prompt();
+
+	/** Llamante: el destino ha descolgado (200 OK al INVITE). El ACK se envia en el paso 4. */
+	public void onCallAccepted(OKMessage ok) {
+		callState = CallState.IN_CALL;
+		System.out.println("Llamada establecida con " + ok.getToUri());
+		prompt();
+	}
+
+	/** Llamante: el INVITE ha recibido una respuesta de error (404, 408, 486 o 503). */
+	public void onCallRejected(int code) {
+		String reason;
+		switch (code) {
+			case 404:
+				reason = "el destino no esta registrado";
+				break;
+			case 408:
+				reason = "el destino no contesta";
+				break;
+			case 486:
+				reason = "el destino esta ocupado o ha rechazado la llamada";
+				break;
+			case 503:
+				reason = "el proxy esta ocupado con otra llamada";
+				break;
+			default:
+				reason = "error";
+		}
+		System.out.println("Llamada rechazada (" + code + "): " + reason);
+		callState = CallState.IDLE;
+		stopVitextClient();
+		prompt();
 	}
 
 	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
