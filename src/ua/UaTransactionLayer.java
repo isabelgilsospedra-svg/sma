@@ -57,6 +57,25 @@ public class UaTransactionLayer {
 		            ((NotFoundMessage) sipMessage).getcSeqNumber())) {
 		        userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
 		    }
+		} else if (sipMessage instanceof NotFoundMessage
+		        && "INVITE".equals(((NotFoundMessage) sipMessage).getcSeqStr())) {
+
+			// comprobamos que el 404 corresppnde a INVITE, no al REGISTER. 
+		    NotFoundMessage notFound = (NotFoundMessage) sipMessage;
+
+		    if (caller && notFound.getCallId().equals(inviteCallId) // miramos el call-id
+		            && (inviteState == InviteState.CALLING
+		                || inviteState == InviteState.PROCEEDING)) { // y comprobamos que la transacción espera respuesta
+
+		        setInviteState(InviteState.COMPLETED);
+		        userLayer.onInviteNotFound();
+		        setInviteState(InviteState.TERMINATED);
+		        setInviteState(InviteState.IDLE);
+		        inviteCallId = null;
+
+		    } else {
+		        System.err.println("Unexpected message, throwing away");
+		    }
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {

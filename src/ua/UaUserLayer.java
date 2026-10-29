@@ -82,10 +82,18 @@ public class UaUserLayer {
 		cSeq++;
 		return String.valueOf(cSeq);
 	}
-
+	
 	/** Llamante: el destino esta sonando (180 Ringing). */
 	public void onRinging() {
 		System.out.println("El destino esta sonando...");
+	}
+	
+	/** El INVITE ha sido rechazado porque el destino no esta registrado. */
+	public void onInviteNotFound() {
+	    System.out.println("Llamada rechazada (404): el destino no esta registrado");
+	    callState = CallState.IDLE;
+	    stopVitextClient();
+	    prompt();
 	}
 
 	/** Llamado: ha llegado una llamada entrante. La respuesta (180, S/N) se implementa en el paso 2. */
