@@ -23,6 +23,8 @@ import java.util.ArrayList;
 
 import mensajesSIP.ACKMessage;
 
+import mensajesSIP.ByeMessage;
+
 public class UaTransactionLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -80,8 +82,12 @@ public class UaTransactionLayer {
 					((NotFoundMessage) sipMessage).getcSeqNumber())) {
 				userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
 			}
+		} else if (sipMessage instanceof OKMessage
+				&& "BYE".equals(((OKMessage) sipMessage).getcSeqStr())) {
+			// 200 OK a nuestro BYE: el BYE no tiene maquina de estados, va directo al usuario.
+			userLayer.onByeOk((OKMessage) sipMessage);
 		} else if (sipMessage instanceof OKMessage) {
-			// 200 OK que no es del REGISTER: respuesta a nuestro INVITE.
+			// 200 OK que no es del REGISTER ni del BYE: respuesta a nuestro INVITE.
 			onFinalOk((OKMessage) sipMessage);
 		} else if (sipMessage instanceof NotFoundMessage) {
 			onErrorResponse(((NotFoundMessage) sipMessage).getCallId(), 404);
@@ -93,6 +99,9 @@ public class UaTransactionLayer {
 			onErrorResponse(((ServiceUnavailableMessage) sipMessage).getCallId(), 503);
 		} else if (sipMessage instanceof ACKMessage) {
 			onAck((ACKMessage) sipMessage);
+		} else if (sipMessage instanceof ByeMessage) {
+			// El BYE no tiene maquina de estados (enunciado): lo trata el usuario.
+			userLayer.onByeReceived((ByeMessage) sipMessage);
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {
@@ -194,6 +203,14 @@ public class UaTransactionLayer {
 		} else {
 			userLayer.onAckReceived(ack);
 		}
+	}
+
+	/**
+	 * Envia directamente al otro UA un mensaje que no pertenece a la transaccion
+	 * INVITE: el BYE y su 200 OK (sin loose routing van extremo a extremo).
+	 */
+	public void sendDirect(SIPMessage message, String address, int port) throws IOException {
+		transportLayer.send(message, address, port);
 	}
 
 	/** Llamante: llega un 100 Trying o un 180 Ringing de nuestro INVITE. */

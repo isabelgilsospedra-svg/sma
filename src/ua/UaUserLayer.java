@@ -20,6 +20,8 @@ import mensajesSIP.RingingMessage;
 
 import mensajesSIP.ACKMessage;
 
+import mensajesSIP.ByeMessage;
+
 public class UaUserLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -29,7 +31,8 @@ public class UaUserLayer {
 		IDLE, // sin llamada
 		OUTGOING, // hemos enviado un INVITE y esperamos respuesta
 		INCOMING, // nos ha llegado un INVITE
-		IN_CALL //Llamada aceptada
+		IN_CALL, //Llamada aceptada
+		HANGING_UP // hemos enviado el BYE y esperamos su 200 OK
 	}
 
 	/** Tiempo que suena una llamada entrante antes de responder 408 (ms). */
@@ -41,6 +44,19 @@ public class UaUserLayer {
 
 	/** Call-ID de la llamada establecida (IN_CALL); null si no hay ninguna. */
 	private volatile String currentCallId = null;
+
+	/**
+	 * true cuando la llamada esta activa: el llamante ha recibido el 200 OK y el
+	 * llamado el ACK. Solo entonces se puede colgar con BYE (enunciado).
+	 */
+	private volatile boolean callConfirmed = false;
+	/** Contact "ip:puerto" del otro UA: sin loose routing el BYE va directo a el. */
+	private volatile String remoteContact = null;
+	/** Datos del dialogo para el BYE: nosotros (From) y el otro extremo (To y destination). */
+	private String localUri = null;
+	private String localName = null;
+	private String remoteUri = null;
+	private String remoteName = null;
 
 	private volatile CallState callState = CallState.IDLE;
 
@@ -99,15 +115,34 @@ public class UaUserLayer {
 		cSeq++;
 		return String.valueOf(cSeq);
 	}
+
+	/**
+	 * El contador no baja de n: la siguiente peticion llevara un CSeq mayor.
+	 * Lo usa el llamado al aceptar, para que su BYE no lleve un CSeq menor que
+	 * el del INVITE de la misma llamada (decision D11).
+	 */
+	private synchronized void raiseCSeq(int n) {
+		if (cSeq < n) {
+			cSeq = n;
+		}
+	}
 	
 	/** Llamante: el destino esta sonando (180 Ringing). */
 	public void onRinging() {
 		System.out.println("El destino esta sonando...");
 	}
 
+	/** Llamante: el destino ha descolgado (200 OK al INVITE). Se envia el ACK del 200 y la llamada queda activa. */
 	public void onCallAccepted(OKMessage ok) throws IOException {
 		callState = CallState.IN_CALL;
 		currentCallId = ok.getCallId();
+		// Somos el llamante: nosotros somos el From del INVITE y el otro extremo el To.
+		localUri = ok.getFromUri();
+		localName = ok.getFromName();
+		remoteUri = ok.getToUri();
+		remoteName = ok.getToName();
+		remoteContact = ok.getContact();
+		callConfirmed = true;
 		System.out.println("Llamada establecida con " + ok.getToUri());
 		// Sin loose routing, el ACK del 200 va directo al llamado: a su Contact.
 		String[] contact = ok.getContact().split(":");
@@ -138,6 +173,7 @@ public class UaUserLayer {
 	/** Llamado: llega el ACK del 200 de la llamada establecida. Cualquier otro ACK no es de esta llamada. */
 	public void onAckReceived(ACKMessage ack) {
 		if (callState == CallState.IN_CALL && ack.getCallId().equals(currentCallId)) {
+			callConfirmed = true;
 			System.out.println("ACK recibido: llamada confirmada");
 		} else {
 			System.err.println("Unexpected message, throwing away");
@@ -220,6 +256,14 @@ public class UaUserLayer {
 		System.out.println("Llamada aceptada");
 		InviteMessage invite = incomingInvite;
 		currentCallId = invite.getCallId();
+		// Somos el llamado: nosotros somos el To del INVITE y el otro extremo el From.
+		localUri = invite.getToUri();
+		localName = invite.getToName();
+		remoteUri = invite.getFromUri();
+		remoteName = invite.getFromName();
+		remoteContact = invite.getContact();
+		callConfirmed = false; // la llamada esta activa cuando llegue el ACK
+		raiseCSeq(Integer.parseInt(invite.getcSeqNumber())); // decision D11: CSeq siempre creciente en la llamada
 		// El estado pasa a IN_CALL antes de enviar el 200: el ACK puede llegar enseguida.
 		endIncomingCall(CallState.IN_CALL);
 		transactionLayer.sendOk(buildOk(invite));
@@ -241,6 +285,100 @@ public class UaUserLayer {
 		cancelAnswerTimer();
 		incomingInvite = null;
 		callState = newState;
+	}
+
+	/**
+	 * El usuario teclea BYE. Solo con una llamada activa (llamante: 200 OK
+	 * recibido; llamado: ACK recibido). Sin loose routing el BYE va directo al
+	 * Contact del otro UA. Si cuelga el llamado, To y From quedan invertidos
+	 * respecto al INVITE (From = nosotros, To = el otro extremo).
+	 */
+	private void commandBye() throws IOException {
+		if (callState != CallState.IN_CALL || !callConfirmed) {
+			System.out.println("No hay ninguna llamada activa: BYE solo se puede usar con la llamada establecida");
+			return;
+		}
+		ByeMessage bye = buildBye();
+		// Decision D10 (provisional): se espera el 200 OK del BYE sin limite; no hay
+		// temporizador ni reenvio del BYE (el enunciado no define maquina de estados para el BYE).
+		callState = CallState.HANGING_UP; // antes de enviar: el 200 OK puede llegar enseguida
+		System.out.println("Colgando la llamada con " + remoteUri);
+		String[] contact = remoteContact.split(":");
+		transactionLayer.sendDirect(bye, contact[0], Integer.parseInt(contact[1]));
+	}
+
+	/** BYE: peticion nueva, asi que lleva un CSeq nuevo; Call-ID de la llamada. */
+	private ByeMessage buildBye() {
+		ByeMessage bye = new ByeMessage();
+		bye.setDestination(remoteUri);
+		bye.setVias(new ArrayList<String>(Arrays.asList(myAddress + ":" + listenPort)));
+		bye.setMaxForwards(70);
+		bye.setToName(remoteName);
+		bye.setToUri(remoteUri);
+		bye.setFromName(localName);
+		bye.setFromUri(localUri);
+		bye.setCallId(currentCallId);
+		bye.setcSeqNumber(nextCSeq());
+		bye.setcSeqStr("BYE");
+		bye.setContentLength(0);
+		return bye;
+	}
+
+	/** Llega un BYE: si es de nuestra llamada, se confirma con 200 OK y la llamada termina. */
+	public void onByeReceived(ByeMessage bye) throws IOException {
+		boolean ours = (callState == CallState.IN_CALL || callState == CallState.HANGING_UP)
+				&& bye.getCallId().equals(currentCallId);
+		if (!ours) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		// La respuesta vuelve por donde vino el BYE: su primera Via.
+		String[] via = bye.getVias().get(0).split(":");
+		transactionLayer.sendDirect(buildByeOk(bye), via[0], Integer.parseInt(via[1]));
+		System.out.println("El otro extremo ha colgado: llamada finalizada");
+		endCall();
+		prompt();
+	}
+
+	/** Llega el 200 OK de nuestro BYE: la llamada termina (hasta entonces seguimos en HANGING_UP, decision D10). */
+	public void onByeOk(OKMessage ok) {
+		if (callState != CallState.HANGING_UP || !ok.getCallId().equals(currentCallId)) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		System.out.println("Llamada finalizada");
+		endCall();
+		prompt();
+	}
+
+	/** Fin de la llamada: se para el video y se vuelve a IDLE para poder hacer otra. */
+	private void endCall() {
+		stopVitextClient();
+		stopVitextServer();
+		currentCallId = null;
+		callConfirmed = false;
+		remoteContact = null;
+		localUri = null;
+		localName = null;
+		remoteUri = null;
+		remoteName = null;
+		callState = CallState.IDLE;
+	}
+
+	/** 200 OK al BYE: copia Vias, To, From, Call-ID y CSeq del BYE. */
+	private OKMessage buildByeOk(ByeMessage bye) {
+		OKMessage ok = new OKMessage();
+		ok.setVias(new ArrayList<String>(bye.getVias()));
+		ok.setToName(bye.getToName());
+		ok.setToUri(bye.getToUri());
+		ok.setFromName(bye.getFromName());
+		ok.setFromUri(bye.getFromUri());
+		ok.setCallId(bye.getCallId());
+		ok.setcSeqNumber(bye.getcSeqNumber());
+		ok.setcSeqStr(bye.getcSeqStr());
+		ok.setContact(myAddress + ":" + listenPort);
+		ok.setContentLength(0);
+		return ok;
 	}
 
 	/*
@@ -408,7 +546,10 @@ public class UaUserLayer {
 					System.out.println("Llamada entrante de " + incomingInvite.getFromUri() + ": S para aceptar, N para rechazar");
 					break;
 				case IN_CALL:
-					System.out.println("En llamada");
+					System.out.println("En llamada: BYE para colgar");
+					break;
+				case HANGING_UP:
+					System.out.println("Colgando: esperando el 200 OK del BYE");
 					break;
 			}
 		}
@@ -431,6 +572,8 @@ public class UaUserLayer {
 			}
 		} else if (line.toUpperCase().startsWith("INVITE")) {
 			commandInvite(line);
+		} else if (line.equalsIgnoreCase("BYE")) {
+			commandBye();
 		} else {
 			System.out.println("Bad command");
 		}
