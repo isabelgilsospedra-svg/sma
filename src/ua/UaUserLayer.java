@@ -18,6 +18,8 @@ import mensajesSIP.BusyHereMessage;
 import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.RingingMessage;
 
+import mensajesSIP.ACKMessage;
+
 public class UaUserLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -36,6 +38,9 @@ public class UaUserLayer {
 	private volatile InviteMessage incomingInvite = null;
 	/** Temporizador de 10 s para contestar la llamada entrante. */
 	private Timer answerTimer = null;
+
+	/** Call-ID de la llamada establecida (IN_CALL); null si no hay ninguna. */
+	private volatile String currentCallId = null;
 
 	private volatile CallState callState = CallState.IDLE;
 
@@ -100,11 +105,43 @@ public class UaUserLayer {
 		System.out.println("El destino esta sonando...");
 	}
 
-	/** Llamante: el destino ha descolgado (200 OK al INVITE). El ACK se envia en el paso 4. */
-	public void onCallAccepted(OKMessage ok) {
+	public void onCallAccepted(OKMessage ok) throws IOException {
 		callState = CallState.IN_CALL;
+		currentCallId = ok.getCallId();
 		System.out.println("Llamada establecida con " + ok.getToUri());
+		// Sin loose routing, el ACK del 200 va directo al llamado: a su Contact.
+		String[] contact = ok.getContact().split(":");
+		transactionLayer.sendAck(buildAckForOk(ok), contact[0], Integer.parseInt(contact[1]));
 		prompt();
+	}
+
+	/**
+	 * ACK del 200: lo genera el usuario (TU), no la transaccion. Repite Call-ID,
+	 * To, From y el numero de CSeq del INVITE (no se incrementa), con metodo ACK.
+	 */
+	private ACKMessage buildAckForOk(OKMessage ok) {
+		ACKMessage ack = new ACKMessage();
+		ack.setDestination(ok.getToUri());
+		ack.setVias(new ArrayList<String>(Arrays.asList(myAddress + ":" + listenPort)));
+		ack.setMaxForwards(70);
+		ack.setToName(ok.getToName());
+		ack.setToUri(ok.getToUri());
+		ack.setFromName(ok.getFromName());
+		ack.setFromUri(ok.getFromUri());
+		ack.setCallId(ok.getCallId());
+		ack.setcSeqNumber(ok.getcSeqNumber());
+		ack.setcSeqStr("ACK");
+		ack.setContentLength(0);
+		return ack;
+	}
+
+	/** Llamado: llega el ACK del 200 de la llamada establecida. Cualquier otro ACK no es de esta llamada. */
+	public void onAckReceived(ACKMessage ack) {
+		if (callState == CallState.IN_CALL && ack.getCallId().equals(currentCallId)) {
+			System.out.println("ACK recibido: llamada confirmada");
+		} else {
+			System.err.println("Unexpected message, throwing away");
+		}
 	}
 
 	/** Llamante: el INVITE ha recibido una respuesta de error (404, 408, 486 o 503). */
@@ -181,9 +218,12 @@ public class UaUserLayer {
 		}
 		cancelAnswerTimer();
 		System.out.println("Llamada aceptada");
-		transactionLayer.sendOk(buildOk(incomingInvite));
-		runVitextServer();
+		InviteMessage invite = incomingInvite;
+		currentCallId = invite.getCallId();
+		// El estado pasa a IN_CALL antes de enviar el 200: el ACK puede llegar enseguida.
 		endIncomingCall(CallState.IN_CALL);
+		transactionLayer.sendOk(buildOk(invite));
+		runVitextServer();
 	}
 
 	/** El usuario rechaza (N): 486 Busy Here. */

@@ -19,6 +19,10 @@ import mensajesSIP.BusyHereMessage;
 import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.ServiceUnavailableMessage;
 
+import java.util.ArrayList;
+
+import mensajesSIP.ACKMessage;
+
 public class UaTransactionLayer {
 	//private static final int IDLE = 0;
 	//private int state = IDLE;
@@ -32,6 +36,13 @@ public class UaTransactionLayer {
 	/** Temporizador de reenvio del REGISTER; null si no hay ninguno pendiente. */
 	private Timer registerTimer = null;
 	private RegisterMessage pendingRegister = null; // guarda el mensaje cuyo 200  OK o 404 estamos esperando
+
+	/** Llamado: cada cuanto se reenvia el error en Completed mientras no llega el ACK (ms). */
+	private static final long RETRANSMIT_MS = 200;
+	/** Llamado: temporizador de reenvio del error cada 200 ms. */
+	private Timer retransmitTimer = null;
+	/** Llamante: el INVITE enviado; de el salen los campos del ACK a un error. */
+	private InviteMessage sentInvite = null;
 
 	/** Estado de la transaccion INVITE en curso (IDLE si no hay ninguna). */
 	private InviteState inviteState = InviteState.IDLE;
@@ -80,6 +91,8 @@ public class UaTransactionLayer {
 			onErrorResponse(((BusyHereMessage) sipMessage).getCallId(), 486);
 		} else if (sipMessage instanceof ServiceUnavailableMessage) {
 			onErrorResponse(((ServiceUnavailableMessage) sipMessage).getCallId(), 503);
+		} else if (sipMessage instanceof ACKMessage) {
+			onAck((ACKMessage) sipMessage);
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {
@@ -131,14 +144,56 @@ public class UaTransactionLayer {
 	 * Proceeding -> Completed; a 1 s, Terminated. El envio del ACK (y su
 	 * reenvio si el error llega repetido) se anade en el paso 4.
 	 */
-	private void onErrorResponse(String callId, int code) {
+	private void onErrorResponse(String callId, int code) throws IOException {
+		if (caller && inviteState == InviteState.COMPLETED && callId.equals(inviteCallId)) {
+			// Diagrama: en Completed, el error repetido (se perdio nuestro ACK) -> se reenvia el ACK.
+			System.out.println("Error " + code + " repetido: se reenvia el ACK");
+			sendAckForError();
+			return;
+		}
 		if (!isResponseToOurInvite(callId)) {
 			System.err.println("Unexpected message, throwing away");
 			return;
 		}
 		setInviteState(InviteState.COMPLETED);
+		sendAckForError();
 		userLayer.onCallRejected(code);
 		startCompletedTimer();
+	}
+
+	/**
+	 * Llamante: ACK a una respuesta de error. Va salto a salto (al proxy, como
+	 * el INVITE) y repite Call-ID, To, From y el numero de CSeq del INVITE, con
+	 * el metodo ACK.
+	 */
+	private void sendAckForError() throws IOException {
+		ACKMessage ack = new ACKMessage();
+		ack.setDestination(sentInvite.getDestination());
+		ack.setVias(new ArrayList<String>(sentInvite.getVias()));
+		ack.setMaxForwards(70);
+		ack.setToName(sentInvite.getToName());
+		ack.setToUri(sentInvite.getToUri());
+		ack.setFromName(sentInvite.getFromName());
+		ack.setFromUri(sentInvite.getFromUri());
+		ack.setCallId(sentInvite.getCallId());
+		ack.setcSeqNumber(sentInvite.getcSeqNumber());
+		ack.setcSeqStr("ACK");
+		ack.setContentLength(0);
+		transportLayer.sendToProxy(ack);
+	}
+
+	/**
+	 * Llega un ACK.
+	 *  - Llamado en Completed (ACK a nuestro error): se para el reenvio y Completed -> Terminated.
+	 *  - Si no, es el ACK del 200 (va de extremo a extremo y la transaccion ya termino): se pasa al usuario.
+	 */
+	private void onAck(ACKMessage ack) {
+		if (!caller && inviteState == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
+			setInviteState(InviteState.TERMINATED);
+			endInviteTransaction();
+		} else {
+			userLayer.onAckReceived(ack);
+		}
 	}
 
 	/** Llamante: llega un 100 Trying o un 180 Ringing de nuestro INVITE. */
@@ -188,8 +243,30 @@ public class UaTransactionLayer {
 		}
 		transportLayer.send(error, responseAddress, responsePort);
 		setInviteState(InviteState.COMPLETED);
+		startRetransmitTimer(error);
 		startCompletedTimer();
 		return true;
+	}
+
+	/** Llamado en Completed: diagrama "Timer 200 ms, send response": se reenvia el error hasta que llegue el ACK. */
+	private void startRetransmitTimer(SIPMessage error) {
+		retransmitTimer = new Timer("ua-retransmit", true);
+		retransmitTimer.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				synchronized (UaTransactionLayer.this) {
+					if (inviteState != InviteState.COMPLETED) {
+						return;
+					}
+					try {
+						System.out.println("Sin ACK: se reenvia la respuesta de error");
+						transportLayer.send(error, responseAddress, responsePort);
+					} catch (IOException e) {
+						System.err.println("Error reenviando la respuesta: " + e.getMessage());
+					}
+				}
+			}
+		}, RETRANSMIT_MS, RETRANSMIT_MS);
 	}
 
 	private void startCompletedTimer() {
@@ -198,6 +275,9 @@ public class UaTransactionLayer {
 			@Override
 			public void run() {
 				synchronized (UaTransactionLayer.this) {
+					if (inviteState != InviteState.COMPLETED) {
+						return; // ya termino (por ejemplo, llego el ACK)
+					}
 					setInviteState(InviteState.TERMINATED);
 					endInviteTransaction();
 				}
@@ -206,10 +286,15 @@ public class UaTransactionLayer {
 	}
 
 	/** Fin de la transaccion INVITE: se vuelve a IDLE para poder atender otra. */
+	/** Fin de la transaccion INVITE: se vuelve a IDLE para poder atender otra. */
 	private void endInviteTransaction() {
 		if (completedTimer != null) {
 			completedTimer.cancel();
 			completedTimer = null;
+		}
+		if (retransmitTimer != null) {
+			retransmitTimer.cancel();
+			retransmitTimer = null;
 		}
 		inviteState = InviteState.IDLE;
 		inviteCallId = null;
@@ -249,10 +334,16 @@ public class UaTransactionLayer {
 		transportLayer.startListening();
 	}
 
+	/** Llamante (TU): envia el ACK del 200 directamente al llamado (extremo a extremo, sin loose routing). */
+	public void sendAck(ACKMessage ack, String address, int port) throws IOException {
+		transportLayer.send(ack, address, port);
+	}
+
 	/** Llamante: envia el INVITE al proxy y la transaccion pasa a Calling. */
 	public synchronized void call(InviteMessage inviteMessage) throws IOException {
 		caller = true;
 		inviteCallId = inviteMessage.getCallId();
+		sentInvite = inviteMessage;
 		setInviteState(InviteState.CALLING);
 		transportLayer.sendToProxy(inviteMessage);
 	}
