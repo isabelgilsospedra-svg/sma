@@ -7,29 +7,35 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
+import common.FindMyIPv4;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.NotFoundMessage;
 import mensajesSIP.OKMessage;
 import mensajesSIP.RegisterMessage;
+import mensajesSIP.SIPMessage;
+import mensajesSIP.ServiceUnavailableMessage;
+import mensajesSIP.TryingMessage;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
 
-import common.FindMyIPv4;
-import mensajesSIP.TryingMessage;
-
-import mensajesSIP.SIPMessage;
-
+/**
+ * Capa de usuario del Proxy.
+ *
+ * Decide que hacer con cada peticion: a quien se deja registrar (los usuarios
+ * de users.xml), donde esta cada usuario registrado, si un INVITE se acepta o
+ * se rechaza y por donde vuelven las respuestas. Los estados de las
+ * transacciones los lleva la capa de transaccion.
+ */
 public class ProxyUserLayer {
-	private ProxyTransactionLayer transactionLayer;
+	private final ProxyTransactionLayer transactionLayer;
 
-	/** Si es true, el proxy se queda en la llamada (Record-Route). Se usa en el bloque 3. */
+	/** Si es true, el proxy se queda en el camino de la llamada (Record-Route). Se usara en el bloque 3. */
 	private final boolean looseRouting;
-	/** Direccion "ip:puerto" del proxy: es la Via que anade a los mensajes que reenvia. */
+	/** "ip:puerto" del proxy: es la Via que pone en los mensajes que reenvia. */
 	private final String myVia;
-	/** Usuarios permitidos (URIs leidas de users.xml), p. ej. "sip:alice@SMA". */
+	/** Usuarios que pueden registrarse (las URIs de users.xml), por ejemplo "sip:alice@SMA". */
 	private final Set<String> allowedUsers = new HashSet<String>();
-
-	/** Tabla de registros: URI del usuario -> donde esta y hasta cuando. */
+	/** Tabla de registros: URI del usuario, donde esta y hasta cuando. */
 	private final Map<String, Registration> registry = new HashMap<String, Registration>();
 
 	/** Una entrada de la tabla de registros. */
@@ -46,10 +52,16 @@ public class ProxyUserLayer {
 	public ProxyUserLayer(int listenPort, boolean looseRouting, boolean debug) throws Exception {
 		this.looseRouting = looseRouting;
 		this.myVia = FindMyIPv4.findMyIPv4Address().getHostAddress() + ":" + listenPort;
-		this.transactionLayer = new ProxyTransactionLayer(listenPort, debug, this);
 		loadAllowedUsers();
+		// La capa de transaccion se crea la ultima, con todo lo nuestro ya inicializado.
+		this.transactionLayer = new ProxyTransactionLayer(listenPort, debug, this);
 	}
 
+	public void startListening() {
+		transactionLayer.startListening();
+	}
+
+	/** Lee users.xml (decision D1) y se queda con las URIs de los usuarios permitidos. */
 	private void loadAllowedUsers() throws Exception {
 		for (User user : UsersServletReader.readUsers().getListUsers()) {
 			allowedUsers.add(user.getId());
@@ -57,10 +69,18 @@ public class ProxyUserLayer {
 		System.out.println("Usuarios permitidos: " + allowedUsers);
 	}
 
+	// =========================================================================
+	// REGISTER
+	// =========================================================================
+
+	/**
+	 * Llega un REGISTER. Si el usuario no esta en users.xml se responde 404. Si
+	 * esta, se guarda (o se actualiza) donde esta y hasta cuando, y se responde 200 OK.
+	 */
 	public void onRegisterReceived(RegisterMessage registerMessage) throws IOException {
 		String user = registerMessage.getToUri();
 
-		// La respuesta vuelve por donde vino la peticion: la primera Via.
+		// La respuesta vuelve por donde vino la peticion: su primera Via.
 		String[] origin = registerMessage.getVias().get(0).split(":");
 		String originAddress = origin[0];
 		int originPort = Integer.parseInt(origin[1]);
@@ -76,14 +96,100 @@ public class ProxyUserLayer {
 		// put() sustituye la entrada anterior si el usuario ya estaba registrado.
 		registry.put(user, new Registration(registerMessage.getContact(), expiresAt));
 		System.out.println("Registrado " + user + " en " + registerMessage.getContact() + " durante " + expires + " s");
-		
-		/*prueba
-		System.out.println("Contacto guardado: " + registry.get(user).contact);
-		System.out.println("Numero de registros en la tabla: " + registry.size());
-		*/
-		
 		transactionLayer.sendResponse(buildOk(registerMessage), originAddress, originPort);
 	}
+
+	/**
+	 * Devuelve el registro vigente del usuario, o null si no esta registrado o
+	 * si su registro ha caducado (en ese caso, ademas, se borra de la tabla).
+	 */
+	private Registration activeRegistration(String user) {
+		Registration registration = registry.get(user);
+		if (registration != null && System.currentTimeMillis() > registration.expiresAt) {
+			System.out.println("El registro de " + user + " ha caducado");
+			registry.remove(user);
+			return null;
+		}
+		return registration;
+	}
+
+	// =========================================================================
+	// INVITE
+	// =========================================================================
+
+	/**
+	 * Llega un INVITE de A para B con el proxy libre.
+	 *
+	 * Si A o B no estan registrados (o su registro ha caducado), se responde
+	 * 404. Si los dos lo estan, se responde 100 Trying a A y el INVITE se
+	 * reenvia a B con nuestra Via puesta delante y Max-Forwards uno menos.
+	 */
+	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
+		String caller = inviteMessage.getFromUri();
+		String callee = inviteMessage.getToUri();
+
+		// La respuesta a A vuelve por donde vino el INVITE: su primera Via.
+		String[] origin = inviteMessage.getVias().get(0).split(":");
+		String addressA = origin[0];
+		int portA = Integer.parseInt(origin[1]);
+
+		// Decision D5 (provisional, a consultar con el profesor): con Max-Forwards
+		// a 0 el INVITE se descarta, sin responder.
+		int maxForwards = inviteMessage.getMaxForwards();
+		if (maxForwards <= 0) {
+			System.out.println("INVITE de " + caller + " descartado: Max-Forwards = 0");
+			return;
+		}
+
+		Registration registrationA = activeRegistration(caller);
+		Registration registrationB = activeRegistration(callee);
+		if (registrationA == null || registrationB == null) {
+			String missing = (registrationA == null) ? caller : callee;
+			System.out.println("INVITE de " + caller + " a " + callee + " rechazado: " + missing + " no esta registrado");
+			transactionLayer.rejectInvite(inviteMessage.getCallId(), buildNotFound(inviteMessage), addressA, portA);
+			return;
+		}
+
+		// El 100 se construye antes de tocar las Vias: debe llevar solo las que traia el INVITE.
+		transactionLayer.acceptInvite(inviteMessage.getCallId(), buildTrying(inviteMessage), addressA, portA);
+
+		inviteMessage.addVia(myVia);
+		inviteMessage.setMaxForwards(maxForwards - 1);
+		String[] contactB = registrationB.contact.split(":");
+		transactionLayer.forwardInvite(inviteMessage, contactB[0], Integer.parseInt(contactB[1]));
+	}
+
+	/**
+	 * Llega un INVITE con otro Call-ID mientras el proxy procesa uno (paso 6).
+	 * Se responde 503 Service Unavailable sin abrir transacciones. El ACK que
+	 * mande A despues se descartara, porque no es de la llamada en curso.
+	 */
+	public void rejectBusy(InviteMessage inviteMessage) throws IOException {
+		System.out.println("INVITE de " + inviteMessage.getFromUri() + " a " + inviteMessage.getToUri()
+				+ " rechazado con 503: el proxy ya esta procesando otra llamada");
+		String[] origin = inviteMessage.getVias().get(0).split(":");
+		transactionLayer.sendResponse(buildServiceUnavailable(inviteMessage), origin[0], Integer.parseInt(origin[1]));
+	}
+
+	/**
+	 * Respuesta de B que hay que hacer llegar a A: el proxy quita su propia Via
+	 * (la primera) y la envia a la siguiente, que es la de A.
+	 */
+	public void forwardResponseToA(SIPMessage response, ArrayList<String> vias) throws IOException {
+		if (!vias.get(0).equals(myVia)) {
+			System.err.println("Aviso: la primera Via (" + vias.get(0) + ") no es la del proxy (" + myVia + ")");
+		}
+		vias.remove(0);
+		String[] next = vias.get(0).split(":");
+		transactionLayer.sendResponse(response, next[0], Integer.parseInt(next[1]));
+	}
+
+	// =========================================================================
+	// Construccion de respuestas
+	// =========================================================================
+	//
+	// Todas copian de su peticion las Vias (para volver por el mismo camino),
+	// To, From, Call-ID y CSeq (para que quien la recibe sepa a que responde).
 
 	private OKMessage buildOk(RegisterMessage register) {
 		OKMessage ok = new OKMessage();
@@ -116,72 +222,6 @@ public class ProxyUserLayer {
 		return nf;
 	}
 
-	/**
-	 * Llega un INVITE de A para B. Si alguno de los dos no esta registrado (o su
-	 * registro ha caducado), se responde 404. Si no, 100 Trying a A y el INVITE
-	 * se reenvia a B con la Via del proxy anadida y Max-Forwards - 1.
-	 */
-	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
-		String caller = inviteMessage.getFromUri();
-		String callee = inviteMessage.getToUri();
-
-		// La respuesta a A vuelve por donde vino el INVITE: la primera Via.
-		String[] origin = inviteMessage.getVias().get(0).split(":");
-		String addressA = origin[0];
-		int portA = Integer.parseInt(origin[1]);
-
-		// Decision 1a (pendiente de consultar con el profesor): con Max-Forwards a 0 el INVITE se descarta.
-		int maxForwards = inviteMessage.getMaxForwards();
-		if (maxForwards <= 0) {
-			System.out.println("INVITE de " + caller + " descartado: Max-Forwards = 0");
-			return;
-		}
-
-		Registration registrationA = activeRegistration(caller);
-		Registration registrationB = activeRegistration(callee);
-		if (registrationA == null || registrationB == null) {
-			String missing = (registrationA == null) ? caller : callee;
-			System.out.println("INVITE de " + caller + " a " + callee + " rechazado: " + missing + " no esta registrado");
-			transactionLayer.rejectInvite(inviteMessage.getCallId(), buildNotFound(inviteMessage), addressA, portA);
-			return;
-		}
-
-		// El 100 se construye antes de tocar las Vias: debe llevar solo las que traia el INVITE.
-		transactionLayer.acceptInvite(inviteMessage.getCallId(), buildTrying(inviteMessage), addressA, portA);
-
-		inviteMessage.addVia(myVia);
-		inviteMessage.setMaxForwards(maxForwards - 1);
-		String[] contactB = registrationB.contact.split(":");
-		transactionLayer.forwardInvite(inviteMessage, contactB[0], Integer.parseInt(contactB[1]));
-	}
-
-	/**
-	 * Respuesta de B que hay que hacer llegar a A: el proxy quita su propia Via
-	 * (la primera) y la envia a la siguiente, que es la de A.
-	 */
-	public void forwardResponseToA(SIPMessage response, ArrayList<String> vias) throws IOException {
-		if (!vias.get(0).equals(myVia)) {
-			System.err.println("Aviso: la primera Via (" + vias.get(0) + ") no es la del proxy (" + myVia + ")");
-		}
-		vias.remove(0);
-		String[] next = vias.get(0).split(":");
-		transactionLayer.sendToA(response, next[0], Integer.parseInt(next[1]));
-	}
-
-	/**
-	 * Devuelve el registro vigente del usuario o null si no esta registrado o si
-	 * su registro ha caducado (en ese caso se borra de la tabla).
-	 */
-	private Registration activeRegistration(String user) {
-		Registration registration = registry.get(user);
-		if (registration != null && System.currentTimeMillis() > registration.expiresAt) {
-			System.out.println("El registro de " + user + " ha caducado");
-			registry.remove(user);
-			return null;
-		}
-		return registration;
-	}
-
 	private TryingMessage buildTrying(InviteMessage invite) {
 		TryingMessage trying = new TryingMessage();
 		trying.setVias(new ArrayList<String>(invite.getVias()));
@@ -211,7 +251,17 @@ public class ProxyUserLayer {
 		return nf;
 	}
 
-	public void startListening() {
-		transactionLayer.startListening();
+	private ServiceUnavailableMessage buildServiceUnavailable(InviteMessage invite) {
+		ServiceUnavailableMessage unavailable = new ServiceUnavailableMessage();
+		unavailable.setVias(new ArrayList<String>(invite.getVias()));
+		unavailable.setToName(invite.getToName());
+		unavailable.setToUri(invite.getToUri());
+		unavailable.setFromName(invite.getFromName());
+		unavailable.setFromUri(invite.getFromUri());
+		unavailable.setCallId(invite.getCallId());
+		unavailable.setcSeqNumber(invite.getcSeqNumber());
+		unavailable.setcSeqStr(invite.getcSeqStr());
+		unavailable.setContentLength(0);
+		return unavailable;
 	}
 }

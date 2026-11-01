@@ -1,32 +1,40 @@
 package proxy;
 
 import java.io.IOException;
-
 import java.net.SocketException;
-
-import mensajesSIP.InviteMessage;
-import mensajesSIP.RegisterMessage;
-import mensajesSIP.SIPMessage;
-
+import java.util.ArrayList;
 import java.util.Timer;
 import java.util.TimerTask;
+
 import common.InviteState;
-
-import java.util.ArrayList;
-
+import mensajesSIP.ACKMessage;
 import mensajesSIP.BusyHereMessage;
+import mensajesSIP.InviteMessage;
 import mensajesSIP.OKMessage;
+import mensajesSIP.RegisterMessage;
 import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.RingingMessage;
+import mensajesSIP.SIPMessage;
 
-import mensajesSIP.ACKMessage;
-
+/**
+ * Capa de transaccion del Proxy.
+ *
+ * El REGISTER se atiende sin estado. Cada INVITE, en cambio, se procesa con
+ * dos transacciones a la vez: una con A (el llamante), en la que el proxy hace
+ * de llamado, y otra con B (el llamado), en la que hace de llamante.
+ *
+ * El proxy solo procesa un INVITE cada vez. Mientras tanto, un INVITE con otro
+ * Call-ID recibe un 503 sin abrir transacciones nuevas. Sin loose routing, el
+ * proxy queda libre en cuanto terminan sus dos transacciones.
+ */
 public class ProxyTransactionLayer {
-	//private static final int IDLE = 0;
-	//private int state = IDLE;
-
-	/** Tiempo en Completed antes de pasar a Terminated (ms). */
+	/** Tiempo que se pasa en Completed antes de ir a Terminated (ms). */
 	private static final long COMPLETED_MS = 1000;
+	/** Cada cuanto se reenvia a A el error mientras no llega su ACK (ms). */
+	private static final long RETRANSMIT_MS = 200;
+
+	private final ProxyUserLayer userLayer;
+	private final ProxyTransportLayer transportLayer;
 
 	/** Transaccion con A (llamante): el proxy recibe su INVITE y le responde. */
 	private InviteState stateA = InviteState.IDLE;
@@ -35,42 +43,42 @@ public class ProxyTransactionLayer {
 	/** Call-ID del INVITE que se esta procesando. */
 	private String inviteCallId = null;
 
-	private Timer completedTimerA = null;
+	/** Donde esta A (la primera Via de su INVITE). */
+	private String addressA = null;
+	private int portA = 0;
+	/** Donde esta B (su Contact registrado). */
+	private String addressB = null;
+	private int portB = 0;
+	/** El INVITE tal como se reenvio a B. De el salen los campos del ACK que el proxy envia a B. */
+	private InviteMessage inviteToB = null;
 
-	/** Cada cuanto se reenvia a A el error en Completed mientras no llega su ACK (ms). */
-	private static final long RETRANSMIT_MS = 200;
+	/** Transaccion con A en Completed: temporizador de 1 s. */
+	private Timer completedTimerA = null;
 	/** Transaccion con A en Completed: reenvio del error cada 200 ms. */
 	private Timer retransmitTimerA = null;
 	/** Transaccion con B en Completed: temporizador de 1 s. */
 	private Timer completedTimerB = null;
-	/** Donde esta A (primera Via de su INVITE) y donde esta B (su Contact registrado). */
-	private String addressA = null;
-	private int portA = 0;
-	private String addressB = null;
-	private int portB = 0;
-	/** INVITE tal como se reenvio a B: de el salen los campos del ACK que el proxy envia a B. */
-	private InviteMessage inviteToB = null;
-
-	private ProxyUserLayer userLayer;
-	private ProxyTransportLayer transportLayer;
 
 	public ProxyTransactionLayer(int listenPort, boolean debug, ProxyUserLayer userLayer) throws SocketException {
 		this.userLayer = userLayer;
 		this.transportLayer = new ProxyTransportLayer(listenPort, debug, this);
 	}
 
+	public void startListening() {
+		transportLayer.startListening();
+	}
+
+	// =========================================================================
+	// Mensajes que llegan de la red
+	// =========================================================================
+
+	/** Aqui entra todo lo que llega por la red; cada mensaje se reparte segun su tipo. */
 	public synchronized void onMessageReceived(SIPMessage sipMessage) throws IOException {
 		if (sipMessage instanceof RegisterMessage) {
-			// El REGISTER no depende del estado de la llamada: se atiende siempre.
+			// El REGISTER no depende de ninguna llamada: se atiende siempre.
 			userLayer.onRegisterReceived((RegisterMessage) sipMessage);
 		} else if (sipMessage instanceof InviteMessage) {
-			InviteMessage inviteMessage = (InviteMessage) sipMessage;
-			if (stateA == InviteState.IDLE) {
-				userLayer.onInviteReceived(inviteMessage);
-			} else {
-				// Ya hay un INVITE en proceso: se tratara en el paso 6 (503 Service Unavailable).
-				System.err.println("Unexpected message, throwing away");
-			}
+			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof ACKMessage) {
 			onAckFromA((ACKMessage) sipMessage);
 		} else if (sipMessage instanceof RingingMessage) {
@@ -91,19 +99,35 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
-	 * Respuesta de B al INVITE reenviado. Cambia el estado de las dos
-	 * transacciones y la respuesta se reenvia a A (la capa de usuario quita la
-	 * Via del proxy y la envia a la Via siguiente).
-	 *  - 180: con B, Calling -> Proceeding; con A sigue en Proceeding.
-	 *  - 200: con B y con A, -> Terminated. Sin loose routing el proxy sale de la llamada.
-	 *  - 486/408: con B, Completed + ACK a B (salto a salto); a 1 s, Terminated.
-	 *    Con A, Completed: reenvio del error cada 200 ms hasta el ACK de A; a 1 s, Terminated.
-	 *  - Error repetido de B con B en Completed: se reenvia el ACK a B.
+	 * Llega un INVITE. Si el proxy esta libre, lo procesa la capa de usuario.
+	 * Si ya esta con otro (paso 6): si trae el mismo Call-ID es una repeticion
+	 * y se descarta; si trae otro, se responde 503 sin abrir transacciones.
+	 */
+	private void onInvite(InviteMessage inviteMessage) throws IOException {
+		if (stateA == InviteState.IDLE) {
+			userLayer.onInviteReceived(inviteMessage);
+		} else if (inviteMessage.getCallId().equals(inviteCallId)) {
+			System.err.println("Unexpected message, throwing away");
+		} else {
+			userLayer.rejectBusy(inviteMessage);
+		}
+	}
+
+	/**
+	 * Respuesta de B al INVITE que le reenviamos. Se actualizan las dos
+	 * transacciones y la respuesta se reenvia a A (la capa de usuario quita
+	 * nuestra Via y la manda a la siguiente).
+	 * <ul>
+	 * <li>180: con B se pasa de Calling a Proceeding; con A se sigue en Proceeding.</li>
+	 * <li>200: las dos transacciones terminan. Sin loose routing, el proxy sale de la llamada.</li>
+	 * <li>486 o 408: con B, Completed y ACK a B (salto a salto); a 1 s, Terminated.
+	 * Con A, Completed: se reenvia el error cada 200 ms hasta el ACK de A; a 1 s, Terminated.</li>
+	 * <li>Si B repite el error estando ya en Completed, es que nuestro ACK se perdio: se reenvia.</li>
+	 * </ul>
 	 */
 	private void onResponseFromB(SIPMessage response, String callId, ArrayList<String> vias, int code)
 			throws IOException {
 		if (code >= 300 && stateB == InviteState.COMPLETED && callId.equals(inviteCallId)) {
-			// Diagrama del llamante (proxy con B): en Completed, el error repetido -> se reenvia el ACK.
 			System.out.println("[Proxy] Error " + code + " repetido de B: se reenvia el ACK a B");
 			sendAckToB();
 			return;
@@ -125,30 +149,37 @@ public class ProxyTransactionLayer {
 			setStateA(InviteState.TERMINATED);
 			endInvite();
 		} else {
-			// Con B: el proxy es el llamante -> Completed y ACK a B (salto a salto).
+			// Con B el proxy es el llamante: Completed y ACK a B.
 			setStateB(InviteState.COMPLETED);
 			sendAckToB();
 			startCompletedTimerB();
-			// Con A: el proxy es el llamado -> reenvia el error y espera el ACK de A.
+			// Con A el proxy es el llamado: reenvia el error y espera el ACK de A.
 			userLayer.forwardResponseToA(response, vias);
 			enterCompletedA(response);
 		}
 	}
 
-	/** Envia a A una respuesta que llego de B (ya sin la Via del proxy). */
-	public void sendToA(SIPMessage response, String addressA, int portA) throws IOException {
-		transportLayer.send(response, addressA, portA);
+	/**
+	 * Llega un ACK. Si la transaccion con A esta en Completed y es su Call-ID,
+	 * es el ACK al error que le enviamos: se deja de reenviar y se pasa a
+	 * Terminated. Cualquier otro ACK se descarta: sin loose routing el ACK del
+	 * 200 va de A a B directamente, y el ACK de un 503 no es de la llamada en curso.
+	 */
+	private void onAckFromA(ACKMessage ack) {
+		if (stateA == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
+			cancelTimer(retransmitTimerA);
+			setStateA(InviteState.TERMINATED);
+			tryEndInvite();
+		} else {
+			System.err.println("Unexpected message, throwing away");
+		}
 	}
 
-	public void sendResponse(SIPMessage response, String address, int port) throws IOException {
-		transportLayer.send(response, address, port);
-	}
+	// =========================================================================
+	// Acciones que pide la capa de usuario
+	// =========================================================================
 
-	/*public void echoInvite(InviteMessage inviteMessage, String address, int port) throws IOException {
-		transportLayer.send(inviteMessage, address, port);
-	}*/
-
-	/** Transaccion con A: el INVITE se acepta. INVITE -> Proceeding y se envia el 100 Trying a A. */
+	/** Transaccion con A: el INVITE se acepta. Pasa a Proceeding y se envia el 100 Trying a A. */
 	public synchronized void acceptInvite(String callId, SIPMessage trying, String addressA, int portA)
 			throws IOException {
 		inviteCallId = callId;
@@ -159,9 +190,9 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
-	 * Transaccion con A: el INVITE se rechaza (404). INVITE -> Proceeding, se
-	 * envia el error y se pasa a Completed (reenvio cada 200 ms hasta el ACK de A;
-	 * a 1 s, Terminated).
+	 * Transaccion con A: el INVITE se rechaza con un 404. Se pasa a Proceeding,
+	 * se envia el error y se entra en Completed: se reenvia cada 200 ms hasta el
+	 * ACK de A, y a 1 s se pasa a Terminated.
 	 */
 	public synchronized void rejectInvite(String callId, SIPMessage error, String addressA, int portA)
 			throws IOException {
@@ -184,8 +215,21 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
-	 * Transaccion con A: el proxy ha enviado un error a A. Completed: se reenvia
-	 * el error cada 200 ms hasta que llegue el ACK de A; a 1 s, Terminated.
+	 * Envia una respuesta que no cambia el estado de ninguna transaccion: las
+	 * respuestas al REGISTER, las de B que se reenvian a A y el 503 a un
+	 * segundo INVITE.
+	 */
+	public void sendResponse(SIPMessage response, String address, int port) throws IOException {
+		transportLayer.send(response, address, port);
+	}
+
+	// =========================================================================
+	// Temporizadores y fin del INVITE
+	// =========================================================================
+
+	/**
+	 * Transaccion con A: le hemos enviado un error. Completed: el error se
+	 * reenvia cada 200 ms hasta que llega el ACK de A, y a 1 s se pasa a Terminated.
 	 */
 	private void enterCompletedA(SIPMessage error) {
 		setStateA(InviteState.COMPLETED);
@@ -209,23 +253,14 @@ public class ProxyTransactionLayer {
 		startCompletedTimerA();
 	}
 
-	/** Llega un ACK. Con A en Completed es el ACK a nuestro error: Completed -> Terminated. */
-	private void onAckFromA(ACKMessage ack) {
-		if (stateA == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
-			cancelTimer(retransmitTimerA);
-			setStateA(InviteState.TERMINATED);
-			tryEndInvite();
-		} else {
-			// Sin loose routing el ACK del 200 va de A a B directamente; aqui no deberia llegar.
-			System.err.println("Unexpected message, throwing away");
-		}
-	}
-
-	/** Transaccion con B: ACK al error de B. Va al Contact de B con la Via del proxy y el CSeq del INVITE. */
+	/**
+	 * Transaccion con B: ACK al error de B. Va al Contact de B, lleva solo la
+	 * Via del proxy (somos nosotros quien lo envia) y el CSeq del INVITE.
+	 */
 	private void sendAckToB() throws IOException {
 		ACKMessage ack = new ACKMessage();
 		ack.setDestination(inviteToB.getDestination());
-		ack.setVias(new ArrayList<String>(inviteToB.getVias().subList(0, 1))); // solo la Via del proxy
+		ack.setVias(new ArrayList<String>(inviteToB.getVias().subList(0, 1)));
 		ack.setMaxForwards(70);
 		ack.setToName(inviteToB.getToName());
 		ack.setToUri(inviteToB.getToUri());
@@ -245,7 +280,7 @@ public class ProxyTransactionLayer {
 			public void run() {
 				synchronized (ProxyTransactionLayer.this) {
 					if (stateA != InviteState.COMPLETED) {
-						return; // ya termino al llegar el ACK de A
+						return; // ya habia terminado al llegar el ACK de A
 					}
 					cancelTimer(retransmitTimerA);
 					setStateA(InviteState.TERMINATED);
@@ -271,7 +306,10 @@ public class ProxyTransactionLayer {
 		}, COMPLETED_MS);
 	}
 
-	/** El INVITE termina cuando las dos transacciones han terminado (B puede no haber empezado: 404). */
+	/**
+	 * El INVITE termina cuando han terminado las dos transacciones. La de B
+	 * puede no haber empezado nunca, como en el 404.
+	 */
 	private void tryEndInvite() {
 		boolean aDone = stateA == InviteState.TERMINATED;
 		boolean bDone = stateB == InviteState.TERMINATED || stateB == InviteState.IDLE;
@@ -280,13 +318,7 @@ public class ProxyTransactionLayer {
 		}
 	}
 
-	private void cancelTimer(Timer timer) {
-		if (timer != null) {
-			timer.cancel();
-		}
-	}
-
-	/** Fin del procesamiento del INVITE: el proxy queda libre para otra llamada. */
+	/** Fin del procesamiento del INVITE: se paran los temporizadores y el proxy queda libre para otra llamada. */
 	private void endInvite() {
 		cancelTimer(completedTimerA);
 		cancelTimer(retransmitTimerA);
@@ -301,18 +333,21 @@ public class ProxyTransactionLayer {
 		System.out.println("[Proxy] Procesamiento del INVITE terminado: proxy libre");
 	}
 
+	private void cancelTimer(Timer timer) {
+		if (timer != null) {
+			timer.cancel();
+		}
+	}
+
+	/** Cambia el estado de la transaccion con A y lo imprime, como pide el enunciado. */
 	private void setStateA(InviteState newState) {
 		System.out.println("[Proxy - transaccion con A (llamante)] " + stateA + " -> " + newState);
 		stateA = newState;
 	}
 
+	/** Cambia el estado de la transaccion con B y lo imprime, como pide el enunciado. */
 	private void setStateB(InviteState newState) {
 		System.out.println("[Proxy - transaccion con B (llamado)] " + stateB + " -> " + newState);
 		stateB = newState;
 	}
-
-	public void startListening() {
-		transportLayer.startListening();
-	}
-
 }

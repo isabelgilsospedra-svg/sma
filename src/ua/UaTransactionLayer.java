@@ -2,64 +2,71 @@ package ua;
 
 import java.io.IOException;
 import java.net.SocketException;
+import java.util.ArrayList;
 import java.util.Timer;
 import java.util.TimerTask;
 
+import common.InviteState;
+import mensajesSIP.ACKMessage;
+import mensajesSIP.BusyHereMessage;
+import mensajesSIP.ByeMessage;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.NotFoundMessage;
 import mensajesSIP.OKMessage;
 import mensajesSIP.RegisterMessage;
-import mensajesSIP.SIPMessage;
-
-import common.InviteState;
+import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.RingingMessage;
+import mensajesSIP.SIPMessage;
+import mensajesSIP.ServiceUnavailableMessage;
 import mensajesSIP.TryingMessage;
 
-import mensajesSIP.BusyHereMessage;
-import mensajesSIP.RequestTimeoutMessage;
-import mensajesSIP.ServiceUnavailableMessage;
-
-import java.util.ArrayList;
-
-import mensajesSIP.ACKMessage;
-
-import mensajesSIP.ByeMessage;
-
+/**
+ * Capa de transaccion del UA.
+ *
+ * Se encarga de dos cosas: del REGISTER, que se reenvia cada 2 s hasta que el
+ * proxy contesta, y de la maquina de estados de la transaccion INVITE, tanto
+ * cuando el UA llama como cuando le llaman. Lo que no pertenece a ninguna
+ * transaccion (el ACK del 200, el BYE y su 200 OK) pasa tal cual a la capa de
+ * usuario.
+ *
+ * Los metodos que tocan el estado son synchronized porque los usan tres hilos:
+ * el de red, el del teclado (a traves de la capa de usuario) y los temporizadores.
+ */
 public class UaTransactionLayer {
-	//private static final int IDLE = 0;
-	//private int state = IDLE;
-
-	/** Cada cuanto se reenvia el REGISTER si el proxy no contesta (ms). */
+	/** Cada cuanto se reenvia el REGISTER mientras el proxy no contesta (ms). */
 	private static final long REGISTER_RETRY_MS = 2000;
-
-	private UaUserLayer userLayer;
-	private UaTransportLayer transportLayer;
-
-	/** Temporizador de reenvio del REGISTER; null si no hay ninguno pendiente. */
-	private Timer registerTimer = null;
-	private RegisterMessage pendingRegister = null; // guarda el mensaje cuyo 200  OK o 404 estamos esperando
-
-	/** Llamado: cada cuanto se reenvia el error en Completed mientras no llega el ACK (ms). */
+	/** Cada cuanto reenvia el llamado su respuesta de error mientras no llega el ACK (ms). */
 	private static final long RETRANSMIT_MS = 200;
-	/** Llamado: temporizador de reenvio del error cada 200 ms. */
-	private Timer retransmitTimer = null;
-	/** Llamante: el INVITE enviado; de el salen los campos del ACK a un error. */
-	private InviteMessage sentInvite = null;
+	/** Tiempo que se pasa en Completed antes de ir a Terminated (ms). */
+	private static final long COMPLETED_MS = 1000;
+
+	private final UaUserLayer userLayer;
+	private final UaTransportLayer transportLayer;
+
+	// ---- REGISTER ----
+
+	/** REGISTER cuyo 200 OK o 404 estamos esperando; null si no hay ninguno pendiente. */
+	private RegisterMessage pendingRegister = null;
+	/** Temporizador que reenvia el REGISTER pendiente. */
+	private Timer registerTimer = null;
+
+	// ---- Transaccion INVITE ----
 
 	/** Estado de la transaccion INVITE en curso (IDLE si no hay ninguna). */
 	private InviteState inviteState = InviteState.IDLE;
-	/** true si en la transaccion INVITE en curso somos el llamante; false si somos el llamado. */
+	/** true si en la transaccion en curso somos el llamante; false si somos el llamado. */
 	private boolean caller = false;
-	/** Call-ID de la transaccion INVITE en curso: los mensajes de otro Call-ID no son de esta llamada. */
+	/** Call-ID de la transaccion en curso: lo que llegue con otro Call-ID no es de esta llamada. */
 	private String inviteCallId = null;
-
-	/** Tiempo en Completed antes de pasar a Terminated (ms). */
-	private static final long COMPLETED_MS = 1000;
-	/** Llamado: a donde se envian las respuestas al INVITE (la primera Via del INVITE: el proxy). */
+	/** Llamante: el INVITE que enviamos. De el salen los campos del ACK a un error. */
+	private InviteMessage sentInvite = null;
+	/** Llamado: a donde van nuestras respuestas, que es la primera Via del INVITE (el proxy). */
 	private String responseAddress = null;
 	private int responsePort = 0;
 	/** Temporizador de 1 s del estado Completed. */
 	private Timer completedTimer = null;
+	/** Llamado: temporizador que reenvia el error cada 200 ms hasta que llega el ACK. */
+	private Timer retransmitTimer = null;
 
 	public UaTransactionLayer(int listenPort, String proxyAddress, int proxyPort, boolean debug,
 							  UaUserLayer userLayer) throws SocketException {
@@ -67,77 +74,169 @@ public class UaTransactionLayer {
 		this.transportLayer = new UaTransportLayer(listenPort, proxyAddress, proxyPort, debug, this);
 	}
 
+	public void startListeningNetwork() {
+		transportLayer.startListening();
+	}
+
+	// =========================================================================
+	// Mensajes que llegan de la red
+	// =========================================================================
+
+	/**
+	 * Aqui entra todo lo que llega por la red. Cada mensaje se reparte segun a
+	 * quien le toca: al REGISTER pendiente, a la transaccion INVITE o
+	 * directamente a la capa de usuario.
+	 */
 	public synchronized void onMessageReceived(SIPMessage sipMessage) throws IOException {
-		if (sipMessage instanceof OKMessage
-				&& isRegister(((OKMessage) sipMessage).getcSeqStr())) {
-			if (finishRegister(
-					((OKMessage) sipMessage).getCallId(),
-					((OKMessage) sipMessage).getcSeqNumber())) {
-				userLayer.onRegisterOk((OKMessage) sipMessage);
-			}
-		} else if (sipMessage instanceof NotFoundMessage
-				&& isRegister(((NotFoundMessage) sipMessage).getcSeqStr())) {
-			if (finishRegister(
-					((NotFoundMessage) sipMessage).getCallId(),
-					((NotFoundMessage) sipMessage).getcSeqNumber())) {
-				userLayer.onRegisterNotFound((NotFoundMessage) sipMessage);
-			}
-		} else if (sipMessage instanceof OKMessage
-				&& "BYE".equals(((OKMessage) sipMessage).getcSeqStr())) {
-			// 200 OK a nuestro BYE: el BYE no tiene maquina de estados, va directo al usuario.
-			userLayer.onByeOk((OKMessage) sipMessage);
-		} else if (sipMessage instanceof OKMessage) {
-			// 200 OK que no es del REGISTER ni del BYE: respuesta a nuestro INVITE.
-			onFinalOk((OKMessage) sipMessage);
+		if (sipMessage instanceof OKMessage) {
+			onOk((OKMessage) sipMessage);
 		} else if (sipMessage instanceof NotFoundMessage) {
-			onErrorResponse(((NotFoundMessage) sipMessage).getCallId(), 404);
+			onNotFound((NotFoundMessage) sipMessage);
 		} else if (sipMessage instanceof RequestTimeoutMessage) {
 			onErrorResponse(((RequestTimeoutMessage) sipMessage).getCallId(), 408);
 		} else if (sipMessage instanceof BusyHereMessage) {
 			onErrorResponse(((BusyHereMessage) sipMessage).getCallId(), 486);
 		} else if (sipMessage instanceof ServiceUnavailableMessage) {
 			onErrorResponse(((ServiceUnavailableMessage) sipMessage).getCallId(), 503);
-		} else if (sipMessage instanceof ACKMessage) {
-			onAck((ACKMessage) sipMessage);
-		} else if (sipMessage instanceof ByeMessage) {
-			// El BYE no tiene maquina de estados (enunciado): lo trata el usuario.
-			userLayer.onByeReceived((ByeMessage) sipMessage);
-		} else if (sipMessage instanceof InviteMessage) {
-			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof TryingMessage) {
 			onProvisional(((TryingMessage) sipMessage).getCallId(), false);
 		} else if (sipMessage instanceof RingingMessage) {
 			onProvisional(((RingingMessage) sipMessage).getCallId(), true);
+		} else if (sipMessage instanceof InviteMessage) {
+			onInvite((InviteMessage) sipMessage);
+		} else if (sipMessage instanceof ACKMessage) {
+			onAck((ACKMessage) sipMessage);
+		} else if (sipMessage instanceof ByeMessage) {
+			// El BYE no tiene maquina de estados (asi lo pide el enunciado): lo trata la capa de usuario.
+			userLayer.onByeReceived((ByeMessage) sipMessage);
 		} else {
 			System.err.println("Unexpected message, throwing away");
 		}
 	}
 
-	/** Llamado: llega un INVITE. Si no hay transaccion en curso, empieza una como llamado. */
-	private void onInvite(InviteMessage inviteMessage) throws IOException {
-		if (inviteState == InviteState.IDLE) {
-			caller = false;
-			inviteCallId = inviteMessage.getCallId();
-			// Las respuestas vuelven por donde vino el INVITE: la primera Via.
-			String[] via = inviteMessage.getVias().get(0).split(":");
-			responseAddress = via[0];
-			responsePort = Integer.parseInt(via[1]);
-			// Diagrama del llamado: INVITE -> Proceeding, pass INV to TU (el UA llamado no envia 100).
-			setInviteState(InviteState.PROCEEDING);
-			userLayer.onInviteReceived(inviteMessage);
+	/** Un 200 OK puede responder a tres peticiones distintas; el metodo de su CSeq dice a cual. */
+	private void onOk(OKMessage ok) throws IOException {
+		String method = ok.getcSeqStr();
+		if ("REGISTER".equals(method)) {
+			if (finishRegister(ok.getCallId(), ok.getcSeqNumber())) {
+				userLayer.onRegisterOk(ok);
+			}
+		} else if ("BYE".equals(method)) {
+			// El BYE no tiene maquina de estados: su 200 OK va directo a la capa de usuario.
+			userLayer.onByeOk(ok);
 		} else {
-			// Ya hay una llamada en curso: se tratara en el paso 6 (486 Busy Here).
-			System.err.println("Unexpected message, throwing away");
+			onFinalOk(ok);
 		}
 	}
 
-	/** Llamante: true si la respuesta es de nuestro INVITE y la transaccion aun espera respuesta final. */
+	/** Un 404 puede responder al REGISTER (usuario no permitido) o al INVITE (destino no registrado). */
+	private void onNotFound(NotFoundMessage notFound) throws IOException {
+		if ("REGISTER".equals(notFound.getcSeqStr())) {
+			if (finishRegister(notFound.getCallId(), notFound.getcSeqNumber())) {
+				userLayer.onRegisterNotFound(notFound);
+			}
+		} else {
+			onErrorResponse(notFound.getCallId(), 404);
+		}
+	}
+
+	// =========================================================================
+	// REGISTER
+	// =========================================================================
+
+	/**
+	 * Envia el REGISTER y lo reenvia cada 2 s hasta que llega el 200 OK o el
+	 * 404. El primer envio lo hace el propio temporizador, sin esperar.
+	 */
+	public synchronized void register(RegisterMessage registerMessage) {
+		stopRegisterTimer();
+		pendingRegister = registerMessage;
+		registerTimer = new Timer("register-retry", true);
+		registerTimer.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				// Sincronizado con la capa: asi no se reenvia un REGISTER que el
+				// hilo de red acaba de dar por respondido.
+				synchronized (UaTransactionLayer.this) {
+					if (pendingRegister == null) {
+						return;
+					}
+					try {
+						transportLayer.sendToProxy(pendingRegister);
+					} catch (IOException e) {
+						System.err.println("Error enviando REGISTER: " + e.getMessage());
+					}
+				}
+			}
+		}, 0, REGISTER_RETRY_MS);
+	}
+
+	/**
+	 * Comprueba que la respuesta es del REGISTER pendiente (mismo Call-ID y
+	 * mismo CSeq). Si lo es, para el reenvio y devuelve true. Si no, la
+	 * respuesta se ignora: es repetida o de un REGISTER anterior.
+	 */
+	private boolean finishRegister(String callId, String cSeqNumber) {
+		if (pendingRegister == null) {
+			return false;
+		}
+		if (!pendingRegister.getCallId().equals(callId) || !pendingRegister.getcSeqNumber().equals(cSeqNumber)) {
+			System.out.println("Respuesta REGISTER no coincidente");
+			return false;
+		}
+		stopRegisterTimer();
+		pendingRegister = null;
+		return true;
+	}
+
+	private void stopRegisterTimer() {
+		if (registerTimer != null) {
+			registerTimer.cancel();
+			registerTimer = null;
+		}
+	}
+
+	// =========================================================================
+	// Transaccion INVITE como llamante
+	// =========================================================================
+
+	/** Llamante: envia el INVITE al proxy y la transaccion pasa a Calling. */
+	public synchronized void call(InviteMessage inviteMessage) throws IOException {
+		caller = true;
+		inviteCallId = inviteMessage.getCallId();
+		sentInvite = inviteMessage;
+		setInviteState(InviteState.CALLING);
+		transportLayer.sendToProxy(inviteMessage);
+	}
+
+	/** Llamante: true si la respuesta es de nuestro INVITE y todavia esperamos la respuesta final. */
 	private boolean isResponseToOurInvite(String callId) {
 		return caller && callId.equals(inviteCallId)
 				&& (inviteState == InviteState.CALLING || inviteState == InviteState.PROCEEDING);
 	}
 
-	/** Llamante: diagrama "200 / 200 to TU": Calling o Proceeding -> Terminated. El ACK del 200 lo envia el TU (paso 4). */
+	/**
+	 * Llamante: llega un 100 Trying o un 180 Ringing. Desde Calling se pasa a
+	 * Proceeding; en Proceeding el estado no cambia. Del 180 se avisa al usuario.
+	 */
+	private void onProvisional(String callId, boolean ringing) {
+		if (!isResponseToOurInvite(callId)) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		if (inviteState == InviteState.CALLING) {
+			setInviteState(InviteState.PROCEEDING);
+		}
+		if (ringing) {
+			userLayer.onRinging();
+		}
+	}
+
+	/**
+	 * Llamante: llega el 200 OK. Se pasa a Terminated y la transaccion acaba
+	 * aqui. El ACK del 200 no es cosa de la transaccion: lo envia la capa de
+	 * usuario, directamente al llamado.
+	 */
 	private void onFinalOk(OKMessage ok) throws IOException {
 		if (!isResponseToOurInvite(ok.getCallId())) {
 			System.err.println("Unexpected message, throwing away");
@@ -149,13 +248,13 @@ public class UaTransactionLayer {
 	}
 
 	/**
-	 * Llamante: diagrama "404/408/486/503, ACK sent, resp. to TU": Calling o
-	 * Proceeding -> Completed; a 1 s, Terminated. El envio del ACK (y su
-	 * reenvio si el error llega repetido) se anade en el paso 4.
+	 * Llamante: llega un error (404, 408, 486 o 503). Se pasa a Completed, se
+	 * envia el ACK y al cabo de 1 s se pasa a Terminated. Si el mismo error
+	 * vuelve a llegar estando en Completed, es que nuestro ACK se perdio y el
+	 * otro lado lo esta reenviando: se manda el ACK otra vez.
 	 */
 	private void onErrorResponse(String callId, int code) throws IOException {
 		if (caller && inviteState == InviteState.COMPLETED && callId.equals(inviteCallId)) {
-			// Diagrama: en Completed, el error repetido (se perdio nuestro ACK) -> se reenvia el ACK.
 			System.out.println("Error " + code + " repetido: se reenvia el ACK");
 			sendAckForError();
 			return;
@@ -171,9 +270,9 @@ public class UaTransactionLayer {
 	}
 
 	/**
-	 * Llamante: ACK a una respuesta de error. Va salto a salto (al proxy, como
-	 * el INVITE) y repite Call-ID, To, From y el numero de CSeq del INVITE, con
-	 * el metodo ACK.
+	 * Llamante: ACK a una respuesta de error. Va salto a salto, es decir, al
+	 * proxy, por el mismo camino que el INVITE. Repite el Call-ID, To, From y el
+	 * numero de CSeq del INVITE, pero con el metodo ACK.
 	 */
 	private void sendAckForError() throws IOException {
 		ACKMessage ack = new ACKMessage();
@@ -191,45 +290,36 @@ public class UaTransactionLayer {
 		transportLayer.sendToProxy(ack);
 	}
 
-	/**
-	 * Llega un ACK.
-	 *  - Llamado en Completed (ACK a nuestro error): se para el reenvio y Completed -> Terminated.
-	 *  - Si no, es el ACK del 200 (va de extremo a extremo y la transaccion ya termino): se pasa al usuario.
-	 */
-	private void onAck(ACKMessage ack) {
-		if (!caller && inviteState == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
-			setInviteState(InviteState.TERMINATED);
-			endInviteTransaction();
-		} else {
-			userLayer.onAckReceived(ack);
-		}
-	}
+	// =========================================================================
+	// Transaccion INVITE como llamado
+	// =========================================================================
 
 	/**
-	 * Envia directamente al otro UA un mensaje que no pertenece a la transaccion
-	 * INVITE: el BYE y su 200 OK (sin loose routing van extremo a extremo).
+	 * Llega un INVITE.
+	 *
+	 * Si el UA esta libre, empieza una transaccion como llamado: pasa a
+	 * Proceeding y avisa al usuario (el UA llamado no envia 100 Trying).
+	 *
+	 * Si ya esta con otra llamada, en cualquier momento hasta recibir el 200 OK
+	 * del BYE, la capa de usuario responde 486 sin abrir otra maquina de
+	 * estados (paso 6).
 	 */
-	public void sendDirect(SIPMessage message, String address, int port) throws IOException {
-		transportLayer.send(message, address, port);
-	}
-
-	/** Llamante: llega un 100 Trying o un 180 Ringing de nuestro INVITE. */
-	private void onProvisional(String callId, boolean ringing) {
-		boolean ours = caller && callId.equals(inviteCallId)
-				&& (inviteState == InviteState.CALLING || inviteState == InviteState.PROCEEDING);
-		if (!ours) {
-			System.err.println("Unexpected message, throwing away");
+	private void onInvite(InviteMessage inviteMessage) throws IOException {
+		if (inviteState != InviteState.IDLE || userLayer.isBusy()) {
+			userLayer.rejectBusy(inviteMessage);
 			return;
 		}
-		// Diagrama del llamante: Calling --100/180--> Proceeding; en Proceeding, 100/180 no cambian el estado.
-		if (inviteState == InviteState.CALLING) {
-			setInviteState(InviteState.PROCEEDING);
-		}
-		if (ringing) {
-			userLayer.onRinging();
-		}
+		caller = false;
+		inviteCallId = inviteMessage.getCallId();
+		// Las respuestas vuelven por donde vino el INVITE: su primera Via.
+		String[] via = inviteMessage.getVias().get(0).split(":");
+		responseAddress = via[0];
+		responsePort = Integer.parseInt(via[1]);
+		setInviteState(InviteState.PROCEEDING);
+		userLayer.onInviteReceived(inviteMessage);
 	}
-	/** Llamado: el usuario (TU) envia el 180 Ringing. La transaccion sigue en Proceeding. */
+
+	/** Llamado: el usuario envia el 180 Ringing. La transaccion sigue en Proceeding. */
 	public synchronized boolean sendRinging(RingingMessage ringing) throws IOException {
 		if (caller || inviteState != InviteState.PROCEEDING) {
 			return false;
@@ -238,7 +328,7 @@ public class UaTransactionLayer {
 		return true;
 	}
 
-	/** Llamado: "200 from TU": se envia el 200 OK y la transaccion pasa a Terminated. */
+	/** Llamado: el usuario descuelga. Se envia el 200 OK y la transaccion pasa a Terminated. */
 	public synchronized boolean sendOk(OKMessage ok) throws IOException {
 		if (caller || inviteState != InviteState.PROCEEDING) {
 			return false;
@@ -250,9 +340,9 @@ public class UaTransactionLayer {
 	}
 
 	/**
-	 * Llamado: "404/408/486/503 from TU": se envia el error y la transaccion pasa
-	 * a Completed; a 1 s, Terminated. La espera del ACK y el reenvio del error
-	 * cada 200 ms se anaden en el paso 4.
+	 * Llamado: el usuario rechaza (486) o no contesta a tiempo (408). Se envia
+	 * el error y se pasa a Completed: el error se reenvia cada 200 ms hasta que
+	 * llega el ACK, y al cabo de 1 s se pasa a Terminated.
 	 */
 	public synchronized boolean sendError(SIPMessage error) throws IOException {
 		if (caller || inviteState != InviteState.PROCEEDING) {
@@ -265,7 +355,22 @@ public class UaTransactionLayer {
 		return true;
 	}
 
-	/** Llamado en Completed: diagrama "Timer 200 ms, send response": se reenvia el error hasta que llegue el ACK. */
+	/**
+	 * Llega un ACK. Si somos el llamado y estamos en Completed con ese Call-ID,
+	 * es el ACK a nuestro error: se deja de reenviar y se pasa a Terminated.
+	 * Cualquier otro ACK no es de la transaccion (normalmente, el ACK del 200,
+	 * que va de extremo a extremo) y se le pasa a la capa de usuario.
+	 */
+	private void onAck(ACKMessage ack) {
+		if (!caller && inviteState == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
+			setInviteState(InviteState.TERMINATED);
+			endInviteTransaction();
+		} else {
+			userLayer.onAckReceived(ack);
+		}
+	}
+
+	/** Llamado en Completed: reenvia el error cada 200 ms mientras no llegue el ACK. */
 	private void startRetransmitTimer(SIPMessage error) {
 		retransmitTimer = new Timer("ua-retransmit", true);
 		retransmitTimer.schedule(new TimerTask() {
@@ -286,6 +391,11 @@ public class UaTransactionLayer {
 		}, RETRANSMIT_MS, RETRANSMIT_MS);
 	}
 
+	// =========================================================================
+	// Partes comunes de la transaccion INVITE
+	// =========================================================================
+
+	/** Al cabo de 1 s en Completed se pasa a Terminated, haya llegado el ACK o no. */
 	private void startCompletedTimer() {
 		completedTimer = new Timer("ua-completed", true);
 		completedTimer.schedule(new TimerTask() {
@@ -293,7 +403,7 @@ public class UaTransactionLayer {
 			public void run() {
 				synchronized (UaTransactionLayer.this) {
 					if (inviteState != InviteState.COMPLETED) {
-						return; // ya termino (por ejemplo, llego el ACK)
+						return; // ya habia terminado, por ejemplo al llegar el ACK
 					}
 					setInviteState(InviteState.TERMINATED);
 					endInviteTransaction();
@@ -302,8 +412,7 @@ public class UaTransactionLayer {
 		}, COMPLETED_MS);
 	}
 
-	/** Fin de la transaccion INVITE: se vuelve a IDLE para poder atender otra. */
-	/** Fin de la transaccion INVITE: se vuelve a IDLE para poder atender otra. */
+	/** Fin de la transaccion INVITE: se paran los temporizadores y se vuelve a IDLE para poder atender otra. */
 	private void endInviteTransaction() {
 		if (completedTimer != null) {
 			completedTimer.cancel();
@@ -316,94 +425,27 @@ public class UaTransactionLayer {
 		inviteState = InviteState.IDLE;
 		inviteCallId = null;
 	}
-	/** Cambia el estado de la transaccion INVITE y lo muestra por pantalla (lo pide el enunciado). */
+
+	/** Cambia el estado de la transaccion y lo imprime, como pide el enunciado. */
 	private void setInviteState(InviteState newState) {
 		String role = caller ? "llamante" : "llamado";
 		System.out.println("[Transaccion INVITE " + role + "] " + inviteState + " -> " + newState);
 		inviteState = newState;
 	}
 
-	/** Una respuesta es del REGISTER si el metodo de su CSeq es REGISTER. */
-	private boolean isRegister(String cSeqMethod) {
-		return "REGISTER".equals(cSeqMethod);
-	}
-	
-	private synchronized boolean finishRegister(String callId, String cSeq) {
-
-	    if (pendingRegister == null) {
-	        return false;
-	    }
-
-	    if (!pendingRegister.getCallId().equals(callId)
-	            || !pendingRegister.getcSeqNumber().equals(cSeq)) {
-
-	        System.out.println("Respuesta REGISTER no coincidente");
-	        return false;
-	    }
-
-	    stopRegisterTimer();
-	    pendingRegister = null;
-
-	    return true;
-	}
-
-	public void startListeningNetwork() {
-		transportLayer.startListening();
-	}
-
-	/** Llamante (TU): envia el ACK del 200 directamente al llamado (extremo a extremo, sin loose routing). */
-	public void sendAck(ACKMessage ack, String address, int port) throws IOException {
-		transportLayer.send(ack, address, port);
-	}
-
-	/** Llamante: envia el INVITE al proxy y la transaccion pasa a Calling. */
-	public synchronized void call(InviteMessage inviteMessage) throws IOException {
-		caller = true;
-		inviteCallId = inviteMessage.getCallId();
-		sentInvite = inviteMessage;
-		setInviteState(InviteState.CALLING);
-		transportLayer.sendToProxy(inviteMessage);
-	}
+	// =========================================================================
+	// Mensajes fuera de la transaccion
+	// =========================================================================
 
 	/**
-	 * Envia el REGISTER y lo reenvia cada 2 s hasta recibir
-	 * una respuesta 200 OK o 404.
+	 * Envia un mensaje directamente al otro extremo, fuera de la transaccion
+	 * INVITE: el ACK del 200, el BYE y su 200 OK (sin loose routing van de
+	 * extremo a extremo) y el 486 a una segunda llamada.
+	 *
+	 * No es synchronized a proposito: lo usa el hilo del teclado, y asi nunca
+	 * se queda esperando al hilo de red.
 	 */
-	public synchronized void register(RegisterMessage registerMessage) throws IOException {
-
-	    stopRegisterTimer();
-
-	    pendingRegister = registerMessage; // guardamos el mensaje que estamos esperando confirmar
-
-	    registerTimer = new Timer("register-retry", true);
-
-	    registerTimer.schedule(new TimerTask() {
-	        @Override
-	        public void run() {
-
-	        	/* aquí evitamos que el temporizador compruebe que hay un REGISTER pendiente y lo 
-	        	 * envíe a otro hilo cuando se de por terminado
-	        	 */
-	            synchronized (UaTransactionLayer.this) {
-
-	                if (pendingRegister == null) {
-	                    return;
-	                }
-
-	                try {
-	                    transportLayer.sendToProxy(pendingRegister);
-	                } catch (IOException e) {
-	                    System.err.println("Error enviando REGISTER: " + e.getMessage());
-	                }
-	            }
-	        }
-	    }, 0, REGISTER_RETRY_MS); // el primer envío realiza el temporizador inmediatamente y los siguientes se programan cada 2 segundos
-	}
-
-	private synchronized void stopRegisterTimer() {
-		if (registerTimer != null) {
-			registerTimer.cancel();
-			registerTimer = null;
-		}
+	public void sendDirect(SIPMessage message, String address, int port) throws IOException {
+		transportLayer.send(message, address, port);
 	}
 }
