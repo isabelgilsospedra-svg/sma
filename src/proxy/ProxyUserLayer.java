@@ -29,7 +29,7 @@ import sipServlet.UsersServletReader;
 public class ProxyUserLayer {
 	private final ProxyTransactionLayer transactionLayer;
 
-	/** Si es true, el proxy se queda en el camino de la llamada (Record-Route). Se usara en el bloque 3. */
+	/** Si es true, el proxy se queda en el camino de la llamada (Record-Route). Todavia no se usa. */
 	private final boolean looseRouting;
 	/** "ip:puerto" del proxy: es la Via que pone en los mensajes que reenvia. */
 	private final String myVia;
@@ -61,7 +61,7 @@ public class ProxyUserLayer {
 		transactionLayer.startListening();
 	}
 
-	/** Lee users.xml (decision D1) y se queda con las URIs de los usuarios permitidos. */
+	/** Lee users.xml y se queda con las URIs de los usuarios permitidos. */
 	private void loadAllowedUsers() throws Exception {
 		for (User user : UsersServletReader.readUsers().getListUsers()) {
 			allowedUsers.add(user.getId());
@@ -133,8 +133,8 @@ public class ProxyUserLayer {
 		String addressA = origin[0];
 		int portA = Integer.parseInt(origin[1]);
 
-		// Decision D5 (provisional, a consultar con el profesor): con Max-Forwards
-		// a 0 el INVITE se descarta, sin responder.
+		// Con Max-Forwards a 0 el INVITE se descarta sin responder, como si se
+		// hubiera perdido: el enunciado no incluye ninguna respuesta para este caso.
 		int maxForwards = inviteMessage.getMaxForwards();
 		if (maxForwards <= 0) {
 			System.out.println("INVITE de " + caller + " descartado: Max-Forwards = 0");
@@ -160,7 +160,7 @@ public class ProxyUserLayer {
 	}
 
 	/**
-	 * Llega un INVITE con otro Call-ID mientras el proxy procesa uno (paso 6).
+	 * Llega un INVITE con otro Call-ID mientras el proxy procesa uno.
 	 * Se responde 503 Service Unavailable sin abrir transacciones. El ACK que
 	 * mande A despues se descartara, porque no es de la llamada en curso.
 	 */
@@ -181,12 +181,11 @@ public class ProxyUserLayer {
 		}
 		vias.remove(0);
 		String[] next = vias.get(0).split(":");
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierden
-		// todas las respuestas que el proxy reenvia a A.
-		// Efecto: un 486 o 408 si se recupera, porque el proxy lo reenvia a A a los
-		// 200 ms desde Completed (fila 16). El 180 y el 200 no se recuperan: no hay
-		// reenvio para ellos, asi que A se queda esperando en Proceeding y B, en
-		// llamada sin recibir el ACK.
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, ninguna de las
+		// respuestas que el proxy reenvia a A llega.
+		// Que se ve: un 486 o un 408 si se recupera, porque el proxy lo reenvia a A a
+		// los 200 ms desde Completed. El 180 y el 200 no se recuperan, porque nadie los
+		// reenvia: A se queda esperando en Proceeding y B, en llamada sin recibir el ACK.
 		transactionLayer.sendResponse(response, next[0], Integer.parseInt(next[1]));
 	}
 

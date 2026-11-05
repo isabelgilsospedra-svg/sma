@@ -63,7 +63,7 @@ public class UaTransportLayer {
 				DatagramPacket packet = new DatagramPacket(buf, buf.length);
 				socket.receive(packet);
 				// Solo los bytes recibidos: el resto del buffer son ceros y el
-				// parser los tomaria como parte del mensaje (decision T3).
+				// parser los tomaria como parte del mensaje.
 				String msg = new String(packet.getData(), 0, packet.getLength());
 				trace("<--", "de " + packet.getAddress().getHostAddress() + ":" + packet.getPort(), msg);
 				SIPMessage sipMessage = SIPMessage.parseMessage(msg);

@@ -74,7 +74,7 @@ public class UaUserLayer {
 	/**
 	 * Usuario al que queremos llamar mientras esperamos un re-registro. Si al
 	 * hacer INVITE el registro habia caducado, primero se registra de nuevo y el
-	 * INVITE sale al llegar el 200 OK (decision D2). null si no hay ninguno.
+	 * INVITE sale al llegar el 200 OK. null si no hay ninguno.
 	 */
 	private volatile String pendingInviteTarget = null;
 
@@ -105,16 +105,16 @@ public class UaUserLayer {
 	 * Contador de CSeq. Cada peticion nueva (REGISTER, INVITE, BYE) usa el
 	 * siguiente numero; el ACK reutiliza el de su INVITE.
 	 *
-	 * Cada UA numera solo sus propias peticiones (decision D11): si cuelga el
-	 * llamado, su BYE lleva el siguiente numero de su contador aunque sea menor
-	 * que el del INVITE. El CSeq es numero mas metodo, asi que "2 INVITE" y
-	 * "2 BYE" no se confunden.
+	 * Cada UA numera solo sus propias peticiones: si cuelga el llamado, su BYE
+	 * lleva el siguiente numero de su contador aunque sea menor que el del
+	 * INVITE. El CSeq es numero mas metodo, asi que "2 INVITE" y "2 BYE" no se
+	 * confunden.
 	 */
 	private int cSeq = 0;
 
 	// ---- vitext ----
-	// Decision D13: vitext es una integracion opcional con la parte RTSP y queda
-	// desactivado (comentado) hasta que toque esa integracion.
+	// vitext es una integracion opcional con la parte RTSP. Queda desactivado
+	// (comentado) hasta que toque esa integracion.
 
 	// private Process vitextClient = null;
 	// private Process vitextServer = null;
@@ -195,7 +195,7 @@ public class UaUserLayer {
 
 	/**
 	 * Ejecuta un comando. Hasta que el UA esta registrado no se acepta ninguno.
-	 * Mientras suena una llamada entrante, solo valen S y N (decision D7).
+	 * Mientras suena una llamada entrante, solo valen S y N.
 	 */
 	private void command(String line) throws IOException {
 		if (!registered) {
@@ -245,7 +245,7 @@ public class UaUserLayer {
 
 	/**
 	 * El proxy acepta el REGISTER. Se apunta cuando caduca el registro y, si
-	 * habia un INVITE esperando a este re-registro, sale ahora (decision D2).
+	 * habia un INVITE esperando a este re-registro, sale ahora.
 	 */
 	public void onRegisterOk(OKMessage okMessage) throws IOException {
 		boolean firstRegistration = !registered;
@@ -281,7 +281,8 @@ public class UaUserLayer {
 	/**
 	 * Comando "INVITE usuario". El destino se escribe sin dominio y se usa el
 	 * nuestro, porque todas las llamadas son dentro del mismo dominio. Si el
-	 * registro ha caducado, primero se registra de nuevo (decision D2).
+	 * registro ha caducado, primero se registra de nuevo y el INVITE sale cuando
+	 * llega el 200 OK de ese REGISTER.
 	 */
 	private void commandInvite(String line) throws IOException {
 		String[] parts = line.split("\\s+");
@@ -307,10 +308,10 @@ public class UaUserLayer {
 
 	/** Construye el INVITE, con un Call-ID nuevo y nuestro SDP, y empieza la transaccion como llamante. */
 	private void sendInvite(String target) throws IOException {
-		// stopVitextServer(); // D13: vitext desactivado
-		// stopVitextClient(); // D13: vitext desactivado
+		// stopVitextServer(); // vitext desactivado
+		// stopVitextClient(); // vitext desactivado
 		System.out.println("Llamando a " + target + "@" + domain + "...");
-		// runVitextClient(); // D13: vitext desactivado
+		// runVitextClient(); // vitext desactivado
 
 		String targetUri = "sip:" + target + "@" + domain;
 		SDPMessage sdp = buildSdp();
@@ -357,10 +358,10 @@ public class UaUserLayer {
 		System.out.println("Llamada establecida con " + ok.getToUri());
 		// Sin loose routing, el ACK del 200 va directo al llamado, a su Contact.
 		String[] contact = ok.getContact().split(":");
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el ACK del 200.
-		// Efecto: el llamado nunca confirma la llamada y no puede colgar ("No hay ninguna
-		// llamada activa"); el 200 no se reenvia porque su transaccion ya termino. Nosotros
-		// si podemos colgar, y el llamado acepta nuestro BYE.
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el ACK del 200 no llega.
+		// Que se ve: el llamado nunca da la llamada por confirmada y no puede colgar
+		// ("No hay ninguna llamada activa"); el 200 no se reenvia porque su transaccion
+		// ya termino. Nosotros si podemos colgar, y el llamado acepta nuestro BYE.
 		transactionLayer.sendDirect(buildAckForOk(ok), contact[0], Integer.parseInt(contact[1]));
 		prompt();
 	}
@@ -368,7 +369,7 @@ public class UaUserLayer {
 	/**
 	 * ACK del 200. No lo genera la transaccion sino el usuario: repite Call-ID,
 	 * To, From y el numero de CSeq del INVITE (no se incrementa), con el metodo
-	 * ACK. Como destination lleva el To del 200 (decision T13).
+	 * ACK. Como destination lleva el To del 200, que es la URI del llamado.
 	 */
 	private ACKMessage buildAckForOk(OKMessage ok) {
 		ACKMessage ack = new ACKMessage();
@@ -388,7 +389,7 @@ public class UaUserLayer {
 
 	/**
 	 * Llamante: el INVITE ha recibido un error. Los cuatro errores siguen el
-	 * mismo camino (decision D8); solo cambia el motivo que se muestra.
+	 * mismo camino; solo cambia el motivo que se muestra.
 	 */
 	public void onCallRejected(int code) {
 		String reason;
@@ -410,7 +411,7 @@ public class UaUserLayer {
 		}
 		System.out.println("Llamada rechazada (" + code + "): " + reason);
 		callState = CallState.IDLE;
-		// stopVitextClient(); // D13: vitext desactivado
+		// stopVitextClient(); // vitext desactivado
 		prompt();
 	}
 
@@ -439,7 +440,7 @@ public class UaUserLayer {
 	}
 
 	/**
-	 * Llega un INVITE de otra llamada estando ocupados (paso 6). Se responde
+	 * Llega un INVITE de otra llamada estando ocupados. Se responde
 	 * 486 Busy Here sin abrir otra maquina de estados. Si despues llega el ACK
 	 * de ese 486, traera otro Call-ID y se descartara como cualquier mensaje
 	 * fuera de contexto.
@@ -472,7 +473,7 @@ public class UaUserLayer {
 		// Se pasa a IN_CALL antes de enviar el 200: el ACK puede llegar enseguida.
 		endIncomingCall(CallState.IN_CALL);
 		transactionLayer.sendOk(buildOk(invite));
-		// runVitextServer(); // D13: vitext desactivado
+		// runVitextServer(); // vitext desactivado
 	}
 
 	/** El usuario rechaza la llamada (N): 486 Busy Here. */
@@ -550,15 +551,15 @@ public class UaUserLayer {
 			return;
 		}
 		ByeMessage bye = buildBye();
-		// Decision D10 (confirmada el 5/11): el 200 OK del BYE se espera sin
-		// limite. No hay temporizador ni reenvio, porque el enunciado no define
-		// maquina de estados para el BYE.
+		// El 200 OK del BYE se espera sin limite: no hay temporizador ni reenvio,
+		// porque el enunciado no define maquina de estados para el BYE.
 		callState = CallState.HANGING_UP; // antes de enviar: el 200 OK puede llegar enseguida
 		System.out.println("Colgando la llamada con " + remoteUri);
 		String[] contact = remoteContact.split(":");
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el BYE.
-		// Efecto: el otro UA no se entera y sigue "En llamada"; nosotros nos quedamos
-		// en "Colgando" para siempre (D10). Hay que reiniciar los dos UA.
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el BYE no llega.
+		// Que se ve: el otro UA no se entera y sigue "En llamada", y nosotros nos
+		// quedamos en "Colgando" para siempre, porque el BYE no se reenvia. Hay que
+		// reiniciar los dos UA.
 		transactionLayer.sendDirect(bye, contact[0], Integer.parseInt(contact[1]));
 	}
 
@@ -593,16 +594,16 @@ public class UaUserLayer {
 		}
 		// La respuesta vuelve por donde vino el BYE: su primera Via.
 		String[] via = bye.getVias().get(0).split(":");
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el 200 OK del BYE.
-		// Efecto: nosotros terminamos la llamada y volvemos a IDLE, pero quien colgo
-		// se queda en "Colgando" para siempre, porque el BYE no se reenvia (D10).
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el 200 OK del BYE no llega.
+		// Que se ve: nosotros terminamos la llamada y volvemos a IDLE, pero quien colgo
+		// se queda en "Colgando" para siempre, porque el BYE no se reenvia.
 		transactionLayer.sendDirect(buildByeOk(bye), via[0], Integer.parseInt(via[1]));
 		System.out.println("El otro extremo ha colgado: llamada finalizada");
 		endCall();
 		prompt();
 	}
 
-	/** Llega el 200 OK de nuestro BYE y la llamada termina. Hasta entonces seguimos en HANGING_UP (decision D10). */
+	/** Llega el 200 OK de nuestro BYE y la llamada termina. Hasta entonces seguimos en HANGING_UP. */
 	public void onByeOk(OKMessage ok) {
 		if (callState != CallState.HANGING_UP || !ok.getCallId().equals(currentCallId)) {
 			System.err.println("Unexpected message, throwing away");
@@ -615,8 +616,8 @@ public class UaUserLayer {
 
 	/** Fin de la llamada: se olvidan sus datos y se vuelve a IDLE para poder hacer otra. */
 	private void endCall() {
-		// stopVitextClient(); // D13: vitext desactivado
-		// stopVitextServer(); // D13: vitext desactivado
+		// stopVitextClient(); // vitext desactivado
+		// stopVitextServer(); // vitext desactivado
 		currentCallId = null;
 		callConfirmed = false;
 		remoteContact = null;
@@ -731,12 +732,12 @@ public class UaUserLayer {
 	}
 
 	// =========================================================================
-	// vitext (decision D13: desactivado)
+	// vitext (desactivado)
 	// =========================================================================
 	//
 	// vitext es una integracion opcional con la parte RTSP. Queda comentado hasta
 	// que toque esa integracion: para recuperarlo hay que descomentar estos
-	// metodos, los dos campos Process y las llamadas marcadas con "D13".
+	// metodos, los dos campos Process y las llamadas marcadas con "vitext desactivado".
 	//
 	// private void runVitextClient() {
 	// 	try {

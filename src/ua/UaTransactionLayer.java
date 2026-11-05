@@ -287,11 +287,11 @@ public class UaTransactionLayer {
 		ack.setcSeqNumber(sentInvite.getcSeqNumber());
 		ack.setcSeqStr("ACK");
 		ack.setContentLength(0);
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierden
-		// todos nuestros ACK a los errores.
-		// Efecto: el proxy reenvia el error cada 200 ms ("Sin ACK de A") y aqui sale
-		// "Error X repetido: se reenvia el ACK" en cada reenvio (filas 16 y 17). A 1 s
-		// el proxy y nosotros pasamos a Terminated; si llega algun error mas tarde, se
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, ninguno de nuestros ACK
+		// a un error llega al proxy.
+		// Que se ve: el proxy reenvia el error cada 200 ms ("Sin ACK de A") y aqui sale
+		// "Error X repetido: se reenvia el ACK" con cada reenvio. Al cabo de 1 s el
+		// proxy y nosotros pasamos a Terminated; un error que llegue despues se
 		// descarta como "Unexpected message".
 		transportLayer.sendToProxy(ack);
 	}
@@ -308,7 +308,7 @@ public class UaTransactionLayer {
 	 *
 	 * Si ya esta con otra llamada, en cualquier momento hasta recibir el 200 OK
 	 * del BYE, la capa de usuario responde 486 sin abrir otra maquina de
-	 * estados (paso 6).
+	 * estados, como pide el enunciado.
 	 */
 	private void onInvite(InviteMessage inviteMessage) throws IOException {
 		if (inviteState != InviteState.IDLE || userLayer.isBusy()) {
@@ -354,10 +354,10 @@ public class UaTransactionLayer {
 		if (caller || inviteState != InviteState.PROCEEDING) {
 			return false;
 		}
-		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el
-		// primer envio del error (486 o 408).
-		// Efecto: a los 200 ms sale "Sin ACK: se reenvia la respuesta de error" y el
-		// error llega en ese reenvio; a partir de ahi todo sigue igual (fila 16).
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el primer envio del
+		// error (486 o 408) no sale.
+		// Que se ve: a los 200 ms aparece "Sin ACK: se reenvia la respuesta de error",
+		// el error llega con ese reenvio y a partir de ahi todo sigue igual.
 		transportLayer.send(error, responseAddress, responsePort);
 		setInviteState(InviteState.COMPLETED);
 		startRetransmitTimer(error);

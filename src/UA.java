@@ -20,7 +20,7 @@ public class UA {
 		String sipUser = args[0];
 		// El usuario tiene que llevar dominio, por ejemplo alice@SMA. Es el mismo
 		// formato que acepta SIPMessage al leer las cabeceras To y From: letras,
-		// numeros y _, y el dominio puede llevar puntos (decision D4).
+		// numeros y _, y el dominio puede llevar puntos.
 		if (!sipUser.matches("\\w+@[\\w\\.]+")) {
 			System.err.println("El usuario SIP debe tener formato nombre@dominio (por ejemplo alice@SMA); recibido: " + sipUser);
 			System.err.println(USAGE);
