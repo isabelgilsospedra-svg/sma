@@ -140,11 +140,20 @@ public class UaUserLayer {
 	// Teclado
 	// =========================================================================
 
-	/** Bucle del hilo principal: muestra el menu, lee una linea y la ejecuta. */
+	/**
+	 * Bucle del hilo principal: muestra el menu, lee una linea y la ejecuta.
+	 * Si se cierra la entrada de teclado (Ctrl+D en Linux, Ctrl+Z en Windows),
+	 * el UA termina limpiamente, sin excepcion.
+	 */
 	public void startListeningKeyboard() {
 		try (Scanner scanner = new Scanner(System.in)) {
 			while (true) {
 				prompt();
+				if (!scanner.hasNextLine()) {
+					System.out.println();
+					System.out.println("Entrada de teclado cerrada: finalizando el UA");
+					System.exit(0);
+				}
 				String line = scanner.nextLine().trim();
 				if (!line.isEmpty()) {
 					command(line);
@@ -385,7 +394,7 @@ public class UaUserLayer {
 		String reason;
 		switch (code) {
 			case 404:
-				reason = "el destino no esta registrado";
+				reason = "el destino, o nosotros, no esta registrado en el proxy";
 				break;
 			case 408:
 				reason = "el destino no contesta";
