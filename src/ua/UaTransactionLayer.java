@@ -287,6 +287,12 @@ public class UaTransactionLayer {
 		ack.setcSeqNumber(sentInvite.getcSeqNumber());
 		ack.setcSeqStr("ACK");
 		ack.setContentLength(0);
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierden
+		// todos nuestros ACK a los errores.
+		// Efecto: el proxy reenvia el error cada 200 ms ("Sin ACK de A") y aqui sale
+		// "Error X repetido: se reenvia el ACK" en cada reenvio (filas 16 y 17). A 1 s
+		// el proxy y nosotros pasamos a Terminated; si llega algun error mas tarde, se
+		// descarta como "Unexpected message".
 		transportLayer.sendToProxy(ack);
 	}
 
@@ -348,6 +354,10 @@ public class UaTransactionLayer {
 		if (caller || inviteState != InviteState.PROCEEDING) {
 			return false;
 		}
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el
+		// primer envio del error (486 o 408).
+		// Efecto: a los 200 ms sale "Sin ACK: se reenvia la respuesta de error" y el
+		// error llega en ese reenvio; a partir de ahi todo sigue igual (fila 16).
 		transportLayer.send(error, responseAddress, responsePort);
 		setInviteState(InviteState.COMPLETED);
 		startRetransmitTimer(error);

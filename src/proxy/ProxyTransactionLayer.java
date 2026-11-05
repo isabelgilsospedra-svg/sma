@@ -200,6 +200,10 @@ public class ProxyTransactionLayer {
 		this.addressA = addressA;
 		this.portA = portA;
 		setStateA(InviteState.PROCEEDING);
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el
+		// primer envio del 404 a A.
+		// Efecto: a los 200 ms sale "[Proxy] Sin ACK de A: se reenvia la respuesta de
+		// error", el 404 llega a A en ese reenvio y A responde con su ACK (fila 16).
 		transportLayer.send(error, addressA, portA);
 		enterCompletedA(error);
 	}
@@ -270,6 +274,12 @@ public class ProxyTransactionLayer {
 		ack.setcSeqNumber(inviteToB.getcSeqNumber());
 		ack.setcSeqStr("ACK");
 		ack.setContentLength(0);
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierden
+		// todos los ACK que el proxy envia a B.
+		// Efecto: B reenvia su error cada 200 ms ("Sin ACK: se reenvia la respuesta de
+		// error") y el proxy responde "[Proxy] Error X repetido de B: se reenvia el ACK
+		// a B" en cada reenvio (filas 16 y 17 en el lado de B). A 1 s B y la
+		// transaccion del proxy con B pasan a Terminated.
 		transportLayer.send(ack, addressB, portB);
 	}
 

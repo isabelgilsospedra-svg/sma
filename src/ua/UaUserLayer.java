@@ -104,13 +104,20 @@ public class UaUserLayer {
 	/**
 	 * Contador de CSeq. Cada peticion nueva (REGISTER, INVITE, BYE) usa el
 	 * siguiente numero; el ACK reutiliza el de su INVITE.
+	 *
+	 * Cada UA numera solo sus propias peticiones (decision D11): si cuelga el
+	 * llamado, su BYE lleva el siguiente numero de su contador aunque sea menor
+	 * que el del INVITE. El CSeq es numero mas metodo, asi que "2 INVITE" y
+	 * "2 BYE" no se confunden.
 	 */
 	private int cSeq = 0;
 
 	// ---- vitext ----
+	// Decision D13: vitext es una integracion opcional con la parte RTSP y queda
+	// desactivado (comentado) hasta que toque esa integracion.
 
-	private Process vitextClient = null;
-	private Process vitextServer = null;
+	// private Process vitextClient = null;
+	// private Process vitextServer = null;
 
 	public UaUserLayer(String sipUser, int listenPort, String proxyAddress, int proxyPort, boolean debug,
 					   int registerTime) throws SocketException, UnknownHostException {
@@ -291,10 +298,10 @@ public class UaUserLayer {
 
 	/** Construye el INVITE, con un Call-ID nuevo y nuestro SDP, y empieza la transaccion como llamante. */
 	private void sendInvite(String target) throws IOException {
-		stopVitextServer();
-		stopVitextClient();
+		// stopVitextServer(); // D13: vitext desactivado
+		// stopVitextClient(); // D13: vitext desactivado
 		System.out.println("Llamando a " + target + "@" + domain + "...");
-		runVitextClient();
+		// runVitextClient(); // D13: vitext desactivado
 
 		String targetUri = "sip:" + target + "@" + domain;
 		SDPMessage sdp = buildSdp();
@@ -341,6 +348,10 @@ public class UaUserLayer {
 		System.out.println("Llamada establecida con " + ok.getToUri());
 		// Sin loose routing, el ACK del 200 va directo al llamado, a su Contact.
 		String[] contact = ok.getContact().split(":");
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el ACK del 200.
+		// Efecto: el llamado nunca confirma la llamada y no puede colgar ("No hay ninguna
+		// llamada activa"); el 200 no se reenvia porque su transaccion ya termino. Nosotros
+		// si podemos colgar, y el llamado acepta nuestro BYE.
 		transactionLayer.sendDirect(buildAckForOk(ok), contact[0], Integer.parseInt(contact[1]));
 		prompt();
 	}
@@ -390,7 +401,7 @@ public class UaUserLayer {
 		}
 		System.out.println("Llamada rechazada (" + code + "): " + reason);
 		callState = CallState.IDLE;
-		stopVitextClient();
+		// stopVitextClient(); // D13: vitext desactivado
 		prompt();
 	}
 
@@ -449,12 +460,10 @@ public class UaUserLayer {
 		remoteName = invite.getFromName();
 		remoteContact = invite.getContact();
 		callConfirmed = false; // la llamada estara activa cuando llegue el ACK
-		// Nuestro BYE no debe llevar un CSeq menor que el del INVITE de esta llamada (decision D11).
-		raiseCSeq(Integer.parseInt(invite.getcSeqNumber()));
 		// Se pasa a IN_CALL antes de enviar el 200: el ACK puede llegar enseguida.
 		endIncomingCall(CallState.IN_CALL);
 		transactionLayer.sendOk(buildOk(invite));
-		runVitextServer();
+		// runVitextServer(); // D13: vitext desactivado
 	}
 
 	/** El usuario rechaza la llamada (N): 486 Busy Here. */
@@ -532,12 +541,15 @@ public class UaUserLayer {
 			return;
 		}
 		ByeMessage bye = buildBye();
-		// Decision D10 (provisional): el 200 OK del BYE se espera sin limite.
-		// No hay temporizador ni reenvio, porque el enunciado no define maquina
-		// de estados para el BYE.
+		// Decision D10 (confirmada el 5/11): el 200 OK del BYE se espera sin
+		// limite. No hay temporizador ni reenvio, porque el enunciado no define
+		// maquina de estados para el BYE.
 		callState = CallState.HANGING_UP; // antes de enviar: el 200 OK puede llegar enseguida
 		System.out.println("Colgando la llamada con " + remoteUri);
 		String[] contact = remoteContact.split(":");
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el BYE.
+		// Efecto: el otro UA no se entera y sigue "En llamada"; nosotros nos quedamos
+		// en "Colgando" para siempre (D10). Hay que reiniciar los dos UA.
 		transactionLayer.sendDirect(bye, contact[0], Integer.parseInt(contact[1]));
 	}
 
@@ -572,6 +584,9 @@ public class UaUserLayer {
 		}
 		// La respuesta vuelve por donde vino el BYE: su primera Via.
 		String[] via = bye.getVias().get(0).split(":");
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierde el 200 OK del BYE.
+		// Efecto: nosotros terminamos la llamada y volvemos a IDLE, pero quien colgo
+		// se queda en "Colgando" para siempre, porque el BYE no se reenvia (D10).
 		transactionLayer.sendDirect(buildByeOk(bye), via[0], Integer.parseInt(via[1]));
 		System.out.println("El otro extremo ha colgado: llamada finalizada");
 		endCall();
@@ -589,10 +604,10 @@ public class UaUserLayer {
 		prompt();
 	}
 
-	/** Fin de la llamada: se para el video, se olvidan sus datos y se vuelve a IDLE para poder hacer otra. */
+	/** Fin de la llamada: se olvidan sus datos y se vuelve a IDLE para poder hacer otra. */
 	private void endCall() {
-		stopVitextClient();
-		stopVitextServer();
+		// stopVitextClient(); // D13: vitext desactivado
+		// stopVitextServer(); // D13: vitext desactivado
 		currentCallId = null;
 		callConfirmed = false;
 		remoteContact = null;
@@ -706,51 +721,40 @@ public class UaUserLayer {
 		return String.valueOf(cSeq);
 	}
 
-	/**
-	 * Sube el contador hasta n si estaba por debajo, para que la siguiente
-	 * peticion lleve un CSeq mayor. Lo usa el llamado al aceptar, para que su
-	 * BYE no lleve un CSeq menor que el del INVITE de la misma llamada
-	 * (decision D11).
-	 */
-	private synchronized void raiseCSeq(int n) {
-		if (cSeq < n) {
-			cSeq = n;
-		}
-	}
-
 	// =========================================================================
-	// vitext
+	// vitext (decision D13: desactivado)
 	// =========================================================================
 	//
-	// Fuera de Linux (o sin xterm) no se puede arrancar: se avisa y la
-	// parte SIP sigue igual (decision D6). La integracion completa es el bloque 6.
-
-	private void runVitextClient() {
-		try {
-			vitextClient = Runtime.getRuntime().exec("xterm -e vitext/vitextclient -p 5000 239.1.2.3");
-		} catch (IOException e) {
-			System.out.println("Aviso: no se pudo arrancar vitextclient (" + e.getMessage() + "); se sigue sin video");
-		}
-	}
-
-	private void stopVitextClient() {
-		if (vitextClient != null) {
-			vitextClient.destroy();
-		}
-	}
-
-	private void runVitextServer() {
-		try {
-			vitextServer = Runtime.getRuntime()
-					.exec("xterm -iconic -e vitext/vitextserver -r 10 -p 5000 vitext/1.vtx 239.1.2.3");
-		} catch (IOException e) {
-			System.out.println("Aviso: no se pudo arrancar vitextserver (" + e.getMessage() + "); se sigue sin video");
-		}
-	}
-
-	private void stopVitextServer() {
-		if (vitextServer != null) {
-			vitextServer.destroy();
-		}
-	}
+	// vitext es una integracion opcional con la parte RTSP. Queda comentado hasta
+	// que toque esa integracion: para recuperarlo hay que descomentar estos
+	// metodos, los dos campos Process y las llamadas marcadas con "D13".
+	//
+	// private void runVitextClient() {
+	// 	try {
+	// 		vitextClient = Runtime.getRuntime().exec("xterm -e vitext/vitextclient -p 5000 239.1.2.3");
+	// 	} catch (IOException e) {
+	// 		System.out.println("Aviso: no se pudo arrancar vitextclient (" + e.getMessage() + "); se sigue sin video");
+	// 	}
+	// }
+	//
+	// private void stopVitextClient() {
+	// 	if (vitextClient != null) {
+	// 		vitextClient.destroy();
+	// 	}
+	// }
+	//
+	// private void runVitextServer() {
+	// 	try {
+	// 		vitextServer = Runtime.getRuntime()
+	// 				.exec("xterm -iconic -e vitext/vitextserver -r 10 -p 5000 vitext/1.vtx 239.1.2.3");
+	// 	} catch (IOException e) {
+	// 		System.out.println("Aviso: no se pudo arrancar vitextserver (" + e.getMessage() + "); se sigue sin video");
+	// 	}
+	// }
+	//
+	// private void stopVitextServer() {
+	// 	if (vitextServer != null) {
+	// 		vitextServer.destroy();
+	// 	}
+	// }
 }

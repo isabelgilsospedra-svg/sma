@@ -181,6 +181,12 @@ public class ProxyUserLayer {
 		}
 		vias.remove(0);
 		String[] next = vias.get(0).split(":");
+		// PRUEBA DE PERDIDA (D9): comentar la linea siguiente simula que se pierden
+		// todas las respuestas que el proxy reenvia a A.
+		// Efecto: un 486 o 408 si se recupera, porque el proxy lo reenvia a A a los
+		// 200 ms desde Completed (fila 16). El 180 y el 200 no se recuperan: no hay
+		// reenvio para ellos, asi que A se queda esperando en Proceeding y B, en
+		// llamada sin recibir el ACK.
 		transactionLayer.sendResponse(response, next[0], Integer.parseInt(next[1]));
 	}
 
