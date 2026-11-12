@@ -96,6 +96,12 @@ public class UaUserLayer {
 	// Datos de la llamada establecida que hacen falta para el BYE: nosotros
 	// (From) y el otro extremo (To, destination y a donde enviarlo).
 	private volatile String remoteContact = null; // "ip:puerto" del otro UA
+	/**
+	 * Ruta de la llamada: el Record-Route que puso el proxy en el INVITE, por
+	 * ejemplo "<sip:192.168.1.34:5060;lr>". Si no es null, el proxy usa loose
+	 * routing y el ACK del 200 y el BYE tienen que pasar por el, con esta misma
+	 * cadena en la cabecera Route. Si es null, van directos al otro UA.
+	 */
 	private volatile String route = null;
 	private String localUri = null;
 	private String localName = null;

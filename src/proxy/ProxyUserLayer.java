@@ -8,20 +8,18 @@ import java.util.Map;
 import java.util.Set;
 
 import common.FindMyIPv4;
+import mensajesSIP.ACKMessage;
+import mensajesSIP.ByeMessage;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.NotFoundMessage;
 import mensajesSIP.OKMessage;
 import mensajesSIP.RegisterMessage;
+import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.SIPMessage;
 import mensajesSIP.ServiceUnavailableMessage;
 import mensajesSIP.TryingMessage;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
-
-import mensajesSIP.RequestTimeoutMessage;
-
-import mensajesSIP.ACKMessage;
-import mensajesSIP.ByeMessage;
 
 /**
  * Capa de usuario del Proxy.

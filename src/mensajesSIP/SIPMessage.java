@@ -1,7 +1,7 @@
 /*
- * Cï¿½digo de base para parsear mensajes SIP
+ * Código de base para parsear mensajes SIP
  * Puede ser adaptado, ampliado, modificado por el alumno
- * segï¿½n sus necesidades para la prï¿½ctica
+ * según sus necesidades para la práctica
  */
 package mensajesSIP;
 
@@ -26,7 +26,7 @@ public abstract class SIPMessage {
     protected String cSeqStr;
     
 /**
- * Convierte el mensaje en un String. Para ello concatena la informaciï¿½n de las cabeceras del mensaje.
+ * Convierte el mensaje en un String. Para ello concatena la información de las cabeceras del mensaje.
  * 
  * @return      el mensaje como String.
  */
@@ -34,9 +34,9 @@ public abstract class SIPMessage {
     public abstract String toStringMessage();
     
 /**
- * Convierte el mensaje en un String. Para ello concatena la informaciï¿½n de las cabeceras del mensaje.
- * <p> Nï¿½tese que es un mï¿½todo de clase o mï¿½todo estï¿½tico de cara a poderse invocar sobre la propia clase SIPMessage. Este mï¿½todo se usa como factorï¿½a para generar los diferentes mensajes SIP a partir de lo recibido de la red.
- * <p> En realidad, como los mensajes generados heradarï¿½n de la clase SIPMessage, al invocar a parseMessage tendremos que hacer un casting a la clase apropiada.
+ * Convierte el mensaje en un String. Para ello concatena la información de las cabeceras del mensaje.
+ * <p> Nótese que es un método de clase o método estático de cara a poderse invocar sobre la propia clase SIPMessage. Este método se usa como factoría para generar los diferentes mensajes SIP a partir de lo recibido de la red.
+ * <p> En realidad, como los mensajes generados heradarán de la clase SIPMessage, al invocar a parseMessage tendremos que hacer un casting a la clase apropiada.
  * 
  * @return      SIPMessage el mensaje parseado. 
  */
@@ -363,7 +363,7 @@ public abstract class SIPMessage {
     
     
     /**
-     * Parsea cada una de las lï¿½neas de Via del mensaje recibido, les quita la parte de Via: SIP/2.0/UDP y el resultado lo devuelve como String para que pueda ser aï¿½adido al ArrayList de las Vias del mensaje
+     * Parsea cada una de las líneas de Via del mensaje recibido, les quita la parte de Via: SIP/2.0/UDP y el resultado lo devuelve como String para que pueda ser añadido al ArrayList de las Vias del mensaje
  	* 
      * @param via en el formato red recibido del mensaje SIP
      * @return 
@@ -501,6 +501,7 @@ public abstract class SIPMessage {
      * @return 
      */
     private static String parseRecordRoute(String recordRoute) throws SIPException{
+        // Modificado para ajustarse a la RFC 3261: <sip:ip:puerto;lr>
         Pattern pattern = Pattern.compile("Record-Route: (<sip:[\\w\\.\\:@]+;lr>)");
         Matcher matcher = pattern.matcher(recordRoute);
         if(matcher.matches()){
@@ -517,6 +518,7 @@ public abstract class SIPMessage {
      * @return 
      */
     private static String parseRoute(String route) throws SIPException{
+        // Modificado para ajustarse a la RFC 3261: <sip:ip:puerto;lr>
         Pattern pattern = Pattern.compile("Route: (<sip:[\\w\\.\\:@]+;lr>)");
         Matcher matcher = pattern.matcher(route);
         if(matcher.matches()){

@@ -9,14 +9,13 @@ import java.util.TimerTask;
 import common.InviteState;
 import mensajesSIP.ACKMessage;
 import mensajesSIP.BusyHereMessage;
+import mensajesSIP.ByeMessage;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.OKMessage;
 import mensajesSIP.RegisterMessage;
 import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.RingingMessage;
 import mensajesSIP.SIPMessage;
-
-import mensajesSIP.ByeMessage;
 
 /**
  * Capa de transaccion del Proxy.
@@ -29,28 +28,25 @@ import mensajesSIP.ByeMessage;
  * Call-ID recibe un 503 sin abrir transacciones nuevas. Sin loose routing, el
  * proxy queda libre en cuanto terminan sus dos transacciones.
  *
- *  * Con loose routing, si la llamada se establece, el proxy sigue en ella: el
- *  * ACK del 200 y el BYE pasan por el, y sigue respondiendo 503 a otros INVITE
- *  * hasta que ve el 200 OK del BYE.
+ * Con loose routing, si la llamada se establece, el proxy sigue en ella: el
+ * ACK del 200 y el BYE pasan por el, y sigue respondiendo 503 a otros INVITE
+ * hasta que ve el 200 OK del BYE.
  */
 public class ProxyTransactionLayer {
 	/** Tiempo que se pasa en Completed antes de ir a Terminated (ms). */
 	private static final long COMPLETED_MS = 1000;
 	/** Cada cuanto se reenvia a A el error mientras no llega su ACK (ms). */
 	private static final long RETRANSMIT_MS = 200;
-
 	/**
 	 * Tiempo maximo que se espera la respuesta final de B (ms). Es mayor que los
 	 * 10 s que tarda B en responder 408 por su cuenta, para no adelantarse a el.
 	 */
 	private static final long NO_ANSWER_MS = 15000;
-
 	/** Tiempo maximo que se espera el 200 OK de un BYE reenviado (ms). */
 	private static final long BYE_MS = 15000;
 
 	private final ProxyUserLayer userLayer;
 	private final ProxyTransportLayer transportLayer;
-
 	/** Si es true, el proxy sigue en la llamada despues del INVITE, hasta el 200 OK del BYE. */
 	private final boolean looseRouting;
 
@@ -76,7 +72,6 @@ public class ProxyTransactionLayer {
 	private Timer retransmitTimerA = null;
 	/** Transaccion con B en Completed: temporizador de 1 s. */
 	private Timer completedTimerB = null;
-
 	/** Transaccion con B: espera maxima de su respuesta final (15 s). */
 	private Timer noAnswerTimerB = null;
 
@@ -309,6 +304,7 @@ public class ProxyTransactionLayer {
 		transportLayer.send(inviteMessage, addressB, portB);
 		startNoAnswerTimerB();
 	}
+
 	/**
 	 * Envia una respuesta que no cambia el estado de ninguna transaccion: las
 	 * respuestas al REGISTER, las de B que se reenvian a A, el 503 a un
