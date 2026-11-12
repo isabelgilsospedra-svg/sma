@@ -18,6 +18,8 @@ import mensajesSIP.TryingMessage;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
 
+import mensajesSIP.RequestTimeoutMessage;
+
 /**
  * Capa de usuario del Proxy.
  *
@@ -254,6 +256,27 @@ public class ProxyUserLayer {
 		nf.setContact(invite.getContact());
 		nf.setContentLength(0);
 		return nf;
+	}
+
+	/**
+	 * 408 que el proxy envia a A cuando B no da respuesta final. Se construye a
+	 * partir del INVITE tal como se reenvio a B, asi que hay que quitar la primera
+	 * Via (la del proxy) para que queden las que traia el INVITE de A.
+	 */
+	public RequestTimeoutMessage buildRequestTimeout(InviteMessage forwardedInvite) {
+		RequestTimeoutMessage timeout = new RequestTimeoutMessage();
+		ArrayList<String> vias = new ArrayList<String>(forwardedInvite.getVias());
+		vias.remove(0);
+		timeout.setVias(vias);
+		timeout.setToName(forwardedInvite.getToName());
+		timeout.setToUri(forwardedInvite.getToUri());
+		timeout.setFromName(forwardedInvite.getFromName());
+		timeout.setFromUri(forwardedInvite.getFromUri());
+		timeout.setCallId(forwardedInvite.getCallId());
+		timeout.setcSeqNumber(forwardedInvite.getcSeqNumber());
+		timeout.setcSeqStr(forwardedInvite.getcSeqStr());
+		timeout.setContentLength(0);
+		return timeout;
 	}
 
 	private ServiceUnavailableMessage buildServiceUnavailable(InviteMessage invite) {

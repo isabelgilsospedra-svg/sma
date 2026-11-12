@@ -33,6 +33,12 @@ public class ProxyTransactionLayer {
 	/** Cada cuanto se reenvia a A el error mientras no llega su ACK (ms). */
 	private static final long RETRANSMIT_MS = 200;
 
+	/**
+	 * Tiempo maximo que se espera la respuesta final de B (ms). Es mayor que los
+	 * 10 s que tarda B en responder 408 por su cuenta, para no adelantarse a el.
+	 */
+	private static final long NO_ANSWER_MS = 15000;
+
 	private final ProxyUserLayer userLayer;
 	private final ProxyTransportLayer transportLayer;
 
@@ -58,6 +64,9 @@ public class ProxyTransactionLayer {
 	private Timer retransmitTimerA = null;
 	/** Transaccion con B en Completed: temporizador de 1 s. */
 	private Timer completedTimerB = null;
+
+	/** Transaccion con B: espera maxima de su respuesta final (15 s). */
+	private Timer noAnswerTimerB = null;
 
 	public ProxyTransactionLayer(int listenPort, boolean debug, ProxyUserLayer userLayer) throws SocketException {
 		this.userLayer = userLayer;
@@ -138,6 +147,10 @@ public class ProxyTransactionLayer {
 			System.err.println("Unexpected message, throwing away");
 			return;
 		}
+		if (code >= 200) {
+			// B ha dado su respuesta final: ya no hay que vigilar si contesta.
+			cancelTimer(noAnswerTimerB);
+		}
 		if (code < 200) {
 			if (stateB == InviteState.CALLING) {
 				setStateB(InviteState.PROCEEDING);
@@ -216,8 +229,8 @@ public class ProxyTransactionLayer {
 		this.portB = portB;
 		setStateB(InviteState.CALLING);
 		transportLayer.send(inviteMessage, addressB, portB);
+		startNoAnswerTimerB();
 	}
-
 	/**
 	 * Envia una respuesta que no cambia el estado de ninguna transaccion: las
 	 * respuestas al REGISTER, las de B que se reenvian a A y el 503 a un
@@ -317,6 +330,45 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
+	 * Transaccion con B: vigila que B de una respuesta final. Si B se cierra
+	 * despues de recibir el INVITE (por ejemplo, mientras suena), nadie
+	 * responderia nunca: A se quedaria esperando y el proxy, ocupado hasta
+	 * reiniciarlo. Por eso, si a los 15 s B no ha dado respuesta final, el proxy
+	 * da por terminada la transaccion con B y responde el mismo 408 a A. Con A se
+	 * sigue el camino normal de un error: Completed, reenvio cada 200 ms hasta su
+	 * ACK y Terminated.
+	 */
+	private void startNoAnswerTimerB() {
+		noAnswerTimerB = new Timer("proxy-no-answer-B", true);
+		noAnswerTimerB.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				synchronized (ProxyTransactionLayer.this) {
+					if (stateB != InviteState.CALLING && stateB != InviteState.PROCEEDING) {
+						return; // B ya habia dado su respuesta final
+					}
+					System.out.println("[Proxy] B no da respuesta final en " + (NO_ANSWER_MS / 1000)
+							+ " s: se responde 408 a A");
+					// A B no se le envia ACK: no ha mandado ningun error que confirmar.
+					setStateB(InviteState.TERMINATED);
+					try {
+						SIPMessage timeout = userLayer.buildRequestTimeout(inviteToB);
+						// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el primer envio
+						// del 408 a A no sale.
+						// Que se ve: a los 200 ms aparece "[Proxy] Sin ACK de A: se reenvia la
+						// respuesta de error", el 408 llega a A con ese reenvio y A responde
+						// con su ACK.
+						transportLayer.send(timeout, addressA, portA);
+						enterCompletedA(timeout);
+					} catch (IOException e) {
+						System.err.println("Error enviando el 408 a A: " + e.getMessage());
+					}
+				}
+			}
+		}, NO_ANSWER_MS);
+	}
+
+	/**
 	 * El INVITE termina cuando han terminado las dos transacciones. La de B
 	 * puede no haber empezado nunca, como en el 404.
 	 */
@@ -333,9 +385,11 @@ public class ProxyTransactionLayer {
 		cancelTimer(completedTimerA);
 		cancelTimer(retransmitTimerA);
 		cancelTimer(completedTimerB);
+		cancelTimer(noAnswerTimerB);
 		completedTimerA = null;
 		retransmitTimerA = null;
 		completedTimerB = null;
+		noAnswerTimerB = null;
 		stateA = InviteState.IDLE;
 		stateB = InviteState.IDLE;
 		inviteCallId = null;
