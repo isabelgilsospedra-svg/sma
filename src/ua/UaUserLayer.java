@@ -96,6 +96,7 @@ public class UaUserLayer {
 	// Datos de la llamada establecida que hacen falta para el BYE: nosotros
 	// (From) y el otro extremo (To, destination y a donde enviarlo).
 	private volatile String remoteContact = null; // "ip:puerto" del otro UA
+	private volatile String route = null;
 	private String localUri = null;
 	private String localName = null;
 	private String remoteUri = null;
@@ -354,22 +355,40 @@ public class UaUserLayer {
 		remoteUri = ok.getToUri();
 		remoteName = ok.getToName();
 		remoteContact = ok.getContact();
+		// Con loose routing, el 200 OK trae el Record-Route que anadio el proxy.
+		route = ok.getRecordRoute();
 		callConfirmed = true;
 		System.out.println("Llamada establecida con " + ok.getToUri());
 		// Sin loose routing, el ACK del 200 va directo al llamado, a su Contact.
-		String[] contact = ok.getContact().split(":");
+		// Con loose routing va al proxy, que lo reenvia.
+		String[] nextHop = nextHop();
 		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el ACK del 200 no llega.
 		// Que se ve: el llamado nunca da la llamada por confirmada y no puede colgar
 		// ("No hay ninguna llamada activa"); el 200 no se reenvia porque su transaccion
 		// ya termino. Nosotros si podemos colgar, y el llamado acepta nuestro BYE.
-		transactionLayer.sendDirect(buildAckForOk(ok), contact[0], Integer.parseInt(contact[1]));
+		transactionLayer.sendDirect(buildAckForOk(ok), nextHop[0], Integer.parseInt(nextHop[1]));
 		prompt();
+	}
+
+	/**
+	 * A donde se envian el ACK del 200 y el BYE, como {ip, puerto}. Sin loose
+	 * routing, al Contact del otro UA (extremo a extremo). Con loose routing, al
+	 * proxy, cuya direccion se saca de la ruta: de "<sip:ip:puerto;lr>" se quita
+	 * "<sip:" por delante y ";lr>" por detras.
+	 */
+	private String[] nextHop() {
+		if (route == null) {
+			return remoteContact.split(":");
+		}
+		String hostPort = route.substring("<sip:".length(), route.indexOf(';'));
+		return hostPort.split(":");
 	}
 
 	/**
 	 * ACK del 200. No lo genera la transaccion sino el usuario: repite Call-ID,
 	 * To, From y el numero de CSeq del INVITE (no se incrementa), con el metodo
-	 * ACK. Como destination lleva el To del 200, que es la URI del llamado.
+	 * ACK. Como destination lleva el To del 200, que es la URI del llamado. Con
+	 * loose routing lleva ademas la cabecera Route con la direccion del proxy.
 	 */
 	private ACKMessage buildAckForOk(OKMessage ok) {
 		ACKMessage ack = new ACKMessage();
@@ -383,6 +402,9 @@ public class UaUserLayer {
 		ack.setCallId(ok.getCallId());
 		ack.setcSeqNumber(ok.getcSeqNumber());
 		ack.setcSeqStr("ACK");
+		if (route != null) {
+			ack.setRoute(route);
+		}
 		ack.setContentLength(0);
 		return ack;
 	}
@@ -469,6 +491,8 @@ public class UaUserLayer {
 		remoteUri = invite.getFromUri();
 		remoteName = invite.getFromName();
 		remoteContact = invite.getContact();
+		// Con loose routing, el INVITE trae el Record-Route que anadio el proxy.
+		route = invite.getRecordRoute();
 		callConfirmed = false; // la llamada estara activa cuando llegue el ACK
 		// Se pasa a IN_CALL antes de enviar el 200: el ACK puede llegar enseguida.
 		endIncomingCall(CallState.IN_CALL);
@@ -543,7 +567,7 @@ public class UaUserLayer {
 	/**
 	 * Comando BYE. Solo vale con la llamada activa (el llamante ya tiene el
 	 * 200 OK y el llamado, el ACK). Sin loose routing el BYE va directo al
-	 * Contact del otro UA.
+	 * Contact del otro UA; con loose routing va al proxy, que lo reenvia.
 	 */
 	private void commandBye() throws IOException {
 		if (callState != CallState.IN_CALL || !callConfirmed) {
@@ -555,18 +579,20 @@ public class UaUserLayer {
 		// porque el enunciado no define maquina de estados para el BYE.
 		callState = CallState.HANGING_UP; // antes de enviar: el 200 OK puede llegar enseguida
 		System.out.println("Colgando la llamada con " + remoteUri);
-		String[] contact = remoteContact.split(":");
+		String[] nextHop = nextHop();
 		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el BYE no llega.
 		// Que se ve: el otro UA no se entera y sigue "En llamada", y nosotros nos
 		// quedamos en "Colgando" para siempre, porque el BYE no se reenvia. Hay que
-		// reiniciar los dos UA.
-		transactionLayer.sendDirect(bye, contact[0], Integer.parseInt(contact[1]));
+		// reiniciar los dos UA. Con loose routing, ademas, el proxy sigue en la
+		// llamada y responde 503 a los demas.
+		transactionLayer.sendDirect(bye, nextHop[0], Integer.parseInt(nextHop[1]));
 	}
 
 	/**
 	 * BYE: es una peticion nueva, asi que lleva un CSeq nuevo, y el Call-ID de
 	 * la llamada. From somos nosotros y To el otro extremo; si colgamos siendo
-	 * el llamado, quedan al reves que en el INVITE.
+	 * el llamado, quedan al reves que en el INVITE. Con loose routing lleva
+	 * ademas la cabecera Route con la direccion del proxy.
 	 */
 	private ByeMessage buildBye() {
 		ByeMessage bye = new ByeMessage();
@@ -580,6 +606,9 @@ public class UaUserLayer {
 		bye.setCallId(currentCallId);
 		bye.setcSeqNumber(nextCSeq());
 		bye.setcSeqStr("BYE");
+		if (route != null) {
+			bye.setRoute(route);
+		}
 		bye.setContentLength(0);
 		return bye;
 	}
@@ -621,6 +650,7 @@ public class UaUserLayer {
 		currentCallId = null;
 		callConfirmed = false;
 		remoteContact = null;
+		route = null;
 		localUri = null;
 		localName = null;
 		remoteUri = null;
@@ -634,7 +664,8 @@ public class UaUserLayer {
 	//
 	// Todas las respuestas copian de su peticion las Vias (para volver por el
 	// mismo camino), To, From, Call-ID y CSeq (para que quien la recibe sepa a
-	// que peticion responde).
+	// que peticion responde). El 180 y el 200 OK del INVITE copian tambien el
+	// Record-Route, si lo trae: asi le llega al llamante la ruta de la llamada.
 
 	private RingingMessage buildRinging(InviteMessage invite) {
 		RingingMessage ringing = new RingingMessage();
@@ -647,6 +678,9 @@ public class UaUserLayer {
 		ringing.setcSeqNumber(invite.getcSeqNumber());
 		ringing.setcSeqStr(invite.getcSeqStr());
 		ringing.setContact(myAddress + ":" + listenPort);
+		if (invite.getRecordRoute() != null) {
+			ringing.setRecordRoute(invite.getRecordRoute());
+		}
 		ringing.setContentLength(0);
 		return ringing;
 	}
@@ -664,6 +698,9 @@ public class UaUserLayer {
 		ok.setcSeqNumber(invite.getcSeqNumber());
 		ok.setcSeqStr(invite.getcSeqStr());
 		ok.setContact(myAddress + ":" + listenPort);
+		if (invite.getRecordRoute() != null) {
+			ok.setRecordRoute(invite.getRecordRoute());
+		}
 		ok.setContentLength(sdp.toStringMessage().getBytes().length);
 		ok.setSdp(sdp);
 		return ok;

@@ -20,6 +20,9 @@ import sipServlet.UsersServletReader;
 
 import mensajesSIP.RequestTimeoutMessage;
 
+import mensajesSIP.ACKMessage;
+import mensajesSIP.ByeMessage;
+
 /**
  * Capa de usuario del Proxy.
  *
@@ -31,10 +34,16 @@ import mensajesSIP.RequestTimeoutMessage;
 public class ProxyUserLayer {
 	private final ProxyTransactionLayer transactionLayer;
 
-	/** Si es true, el proxy se queda en el camino de la llamada (Record-Route). Todavia no se usa. */
+	/** Si es true, el proxy se queda en el camino de la llamada: anade Record-Route al INVITE. */
 	private final boolean looseRouting;
 	/** "ip:puerto" del proxy: es la Via que pone en los mensajes que reenvia. */
 	private final String myVia;
+	/**
+	 * Lo que el proxy pone en Record-Route y lo que espera encontrar en la Route
+	 * del ACK y del BYE: su direccion como URI SIP con el parametro lr de loose
+	 * routing, por ejemplo "<sip:192.168.1.34:5060;lr>".
+	 */
+	private final String myRoute;
 	/** Usuarios que pueden registrarse (las URIs de users.xml), por ejemplo "sip:alice@SMA". */
 	private final Set<String> allowedUsers = new HashSet<String>();
 	/** Tabla de registros: URI del usuario, donde esta y hasta cuando. */
@@ -54,9 +63,10 @@ public class ProxyUserLayer {
 	public ProxyUserLayer(int listenPort, boolean looseRouting, boolean debug) throws Exception {
 		this.looseRouting = looseRouting;
 		this.myVia = FindMyIPv4.findMyIPv4Address().getHostAddress() + ":" + listenPort;
+		this.myRoute = "<sip:" + myVia + ";lr>";
 		loadAllowedUsers();
 		// La capa de transaccion se crea la ultima, con todo lo nuestro ya inicializado.
-		this.transactionLayer = new ProxyTransactionLayer(listenPort, debug, this);
+		this.transactionLayer = new ProxyTransactionLayer(listenPort, looseRouting, debug, this);
 	}
 
 	public void startListening() {
@@ -124,7 +134,9 @@ public class ProxyUserLayer {
 	 *
 	 * Si A o B no estan registrados (o su registro ha caducado), se responde
 	 * 404. Si los dos lo estan, se responde 100 Trying a A y el INVITE se
-	 * reenvia a B con nuestra Via puesta delante y Max-Forwards uno menos.
+	 * reenvia a B con nuestra Via puesta delante y Max-Forwards uno menos. Con
+	 * loose routing se le anade ademas nuestro Record-Route, para que el ACK del
+	 * 200 y el BYE pasen por el proxy.
 	 */
 	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
 		String caller = inviteMessage.getFromUri();
@@ -157,6 +169,9 @@ public class ProxyUserLayer {
 
 		inviteMessage.addVia(myVia);
 		inviteMessage.setMaxForwards(maxForwards - 1);
+		if (looseRouting) {
+			inviteMessage.setRecordRoute(myRoute);
+		}
 		String[] contactB = registrationB.contact.split(":");
 		transactionLayer.forwardInvite(inviteMessage, contactB[0], Integer.parseInt(contactB[1]));
 	}
@@ -189,6 +204,63 @@ public class ProxyUserLayer {
 		// los 200 ms desde Completed. El 180 y el 200 no se recuperan, porque nadie los
 		// reenvia: A se queda esperando en Proceeding y B, en llamada sin recibir el ACK.
 		transactionLayer.sendResponse(response, next[0], Integer.parseInt(next[1]));
+	}
+
+	// =========================================================================
+	// Loose routing: el ACK del 200, el BYE y su 200 OK pasan por el proxy
+	// =========================================================================
+
+	/** Dice si una cabecera Route es la del proxy, es decir, si el mensaje viene para pasar por nosotros. */
+	public boolean isMyRoute(String route) {
+		return myRoute.equals(route);
+	}
+
+	/**
+	 * Reenvia el ACK del 200 al otro extremo de la llamada. Como con cualquier
+	 * peticion que reenvia, el proxy pone su Via delante; y quita la cabecera
+	 * Route, que solo llevaba su propia direccion y ya ha cumplido su funcion.
+	 */
+	public void forwardAck(ACKMessage ack, String address, int port) throws IOException {
+		ack.setRoute(null);
+		ack.addVia(myVia);
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el ACK del 200 se
+		// pierde en el proxy.
+		// Que se ve: el llamado nunca da la llamada por confirmada y no puede colgar
+		// ("No hay ninguna llamada activa"). El llamante si puede colgar, y su BYE
+		// llega al llamado a traves del proxy.
+		transactionLayer.forwardRequest(ack, address, port);
+	}
+
+	/**
+	 * Reenvia el BYE al otro extremo de la llamada: el proxy quita su Route y
+	 * pone su Via delante, para que el 200 OK del BYE vuelva pasando por el.
+	 */
+	public void forwardBye(ByeMessage bye, String address, int port) throws IOException {
+		bye.setRoute(null);
+		bye.addVia(myVia);
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el BYE se pierde en
+		// el proxy.
+		// Que se ve: el otro UA sigue "En llamada" y quien colgo se queda en
+		// "Colgando". A los 15 s el proxy muestra "Sin 200 OK del BYE" y queda libre.
+		transactionLayer.forwardRequest(bye, address, port);
+	}
+
+	/**
+	 * Reenvia el 200 OK del BYE a quien colgo. Como cualquier respuesta, vuelve
+	 * por las Vias: el proxy quita la suya (la primera) y la envia a la siguiente.
+	 */
+	public void forwardByeOk(OKMessage ok) throws IOException {
+		ArrayList<String> vias = ok.getVias();
+		if (!vias.get(0).equals(myVia)) {
+			System.err.println("Aviso: la primera Via (" + vias.get(0) + ") no es la del proxy (" + myVia + ")");
+		}
+		vias.remove(0);
+		String[] next = vias.get(0).split(":");
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el 200 OK del BYE se
+		// pierde en el proxy.
+		// Que se ve: el proxy queda libre, porque el ya ha visto el 200 OK, pero
+		// quien colgo se queda en "Colgando" para siempre.
+		transactionLayer.sendResponse(ok, next[0], Integer.parseInt(next[1]));
 	}
 
 	// =========================================================================

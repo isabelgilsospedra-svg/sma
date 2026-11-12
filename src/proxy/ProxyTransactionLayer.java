@@ -16,6 +16,8 @@ import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.RingingMessage;
 import mensajesSIP.SIPMessage;
 
+import mensajesSIP.ByeMessage;
+
 /**
  * Capa de transaccion del Proxy.
  *
@@ -26,6 +28,10 @@ import mensajesSIP.SIPMessage;
  * El proxy solo procesa un INVITE cada vez. Mientras tanto, un INVITE con otro
  * Call-ID recibe un 503 sin abrir transacciones nuevas. Sin loose routing, el
  * proxy queda libre en cuanto terminan sus dos transacciones.
+ *
+ *  * Con loose routing, si la llamada se establece, el proxy sigue en ella: el
+ *  * ACK del 200 y el BYE pasan por el, y sigue respondiendo 503 a otros INVITE
+ *  * hasta que ve el 200 OK del BYE.
  */
 public class ProxyTransactionLayer {
 	/** Tiempo que se pasa en Completed antes de ir a Terminated (ms). */
@@ -39,8 +45,14 @@ public class ProxyTransactionLayer {
 	 */
 	private static final long NO_ANSWER_MS = 15000;
 
+	/** Tiempo maximo que se espera el 200 OK de un BYE reenviado (ms). */
+	private static final long BYE_MS = 15000;
+
 	private final ProxyUserLayer userLayer;
 	private final ProxyTransportLayer transportLayer;
+
+	/** Si es true, el proxy sigue en la llamada despues del INVITE, hasta el 200 OK del BYE. */
+	private final boolean looseRouting;
 
 	/** Transaccion con A (llamante): el proxy recibe su INVITE y le responde. */
 	private InviteState stateA = InviteState.IDLE;
@@ -68,7 +80,19 @@ public class ProxyTransactionLayer {
 	/** Transaccion con B: espera maxima de su respuesta final (15 s). */
 	private Timer noAnswerTimerB = null;
 
-	public ProxyTransactionLayer(int listenPort, boolean debug, ProxyUserLayer userLayer) throws SocketException {
+	/**
+	 * Loose routing: Call-ID de la llamada establecida en la que sigue el proxy.
+	 * Vale null si no hay ninguna.
+	 */
+	private String callInProgressId = null;
+	/** Loose routing: URI del llamante, para saber hacia que lado reenviar el BYE. */
+	private String callerUri = null;
+	/** Loose routing: espera maxima del 200 OK de un BYE reenviado (15 s). */
+	private Timer byeTimer = null;
+
+	public ProxyTransactionLayer(int listenPort, boolean looseRouting, boolean debug, ProxyUserLayer userLayer)
+			throws SocketException {
+		this.looseRouting = looseRouting;
 		this.userLayer = userLayer;
 		this.transportLayer = new ProxyTransportLayer(listenPort, debug, this);
 	}
@@ -89,7 +113,11 @@ public class ProxyTransactionLayer {
 		} else if (sipMessage instanceof InviteMessage) {
 			onInvite((InviteMessage) sipMessage);
 		} else if (sipMessage instanceof ACKMessage) {
-			onAckFromA((ACKMessage) sipMessage);
+			onAck((ACKMessage) sipMessage);
+		} else if (sipMessage instanceof ByeMessage) {
+			onBye((ByeMessage) sipMessage);
+		} else if (sipMessage instanceof OKMessage && "BYE".equals(((OKMessage) sipMessage).getcSeqStr())) {
+			onByeOk((OKMessage) sipMessage);
 		} else if (sipMessage instanceof RingingMessage) {
 			RingingMessage ringing = (RingingMessage) sipMessage;
 			onResponseFromB(ringing, ringing.getCallId(), ringing.getVias(), 180);
@@ -111,11 +139,14 @@ public class ProxyTransactionLayer {
 	 * Llega un INVITE. Si el proxy esta libre, lo procesa la capa de usuario.
 	 * Si ya esta con otro: si trae el mismo Call-ID es una repeticion
 	 * y se descarta; si trae otro, se responde 503 sin abrir transacciones.
+	 * Con loose routing, el proxy tampoco esta libre mientras dura la llamada
+	 * establecida.
 	 */
 	private void onInvite(InviteMessage inviteMessage) throws IOException {
-		if (stateA == InviteState.IDLE) {
+		if (stateA == InviteState.IDLE && callInProgressId == null) {
 			userLayer.onInviteReceived(inviteMessage);
-		} else if (inviteMessage.getCallId().equals(inviteCallId)) {
+		} else if (inviteMessage.getCallId().equals(inviteCallId)
+				|| inviteMessage.getCallId().equals(callInProgressId)) {
 			System.err.println("Unexpected message, throwing away");
 		} else {
 			userLayer.rejectBusy(inviteMessage);
@@ -128,7 +159,8 @@ public class ProxyTransactionLayer {
 	 * nuestra Via y la manda a la siguiente).
 	 * <ul>
 	 * <li>180: con B se pasa de Calling a Proceeding; con A se sigue en Proceeding.</li>
-	 * <li>200: las dos transacciones terminan. Sin loose routing, el proxy sale de la llamada.</li>
+	 * <li>200: las dos transacciones terminan. Sin loose routing, el proxy sale de la llamada;
+	 * con loose routing, sigue en ella hasta el 200 OK del BYE.</li>
 	 * <li>486 o 408: con B, Completed y ACK a B (salto a salto); a 1 s, Terminated.
 	 * Con A, Completed: se reenvia el error cada 200 ms hasta el ACK de A; a 1 s, Terminated.</li>
 	 * <li>Si B repite el error estando ya en Completed, es que nuestro ACK se perdio: se reenvia.</li>
@@ -160,6 +192,11 @@ public class ProxyTransactionLayer {
 			setStateB(InviteState.TERMINATED);
 			userLayer.forwardResponseToA(response, vias);
 			setStateA(InviteState.TERMINATED);
+			if (looseRouting) {
+				// La llamada queda establecida y el proxy sigue en ella.
+				callInProgressId = inviteCallId;
+				callerUri = inviteToB.getFromUri();
+			}
 			endInvite();
 		} else {
 			// Con B el proxy es el llamante: Completed y ACK a B.
@@ -173,19 +210,60 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
-	 * Llega un ACK. Si la transaccion con A esta en Completed y es su Call-ID,
-	 * es el ACK al error que le enviamos: se deja de reenviar y se pasa a
-	 * Terminated. Cualquier otro ACK se descarta: sin loose routing el ACK del
-	 * 200 va de A a B directamente, y el ACK de un 503 no es de la llamada en curso.
+	 * Llega un ACK. Hay dos que le interesan al proxy:
+	 * <ul>
+	 * <li>El ACK de A al error que le enviamos (transaccion con A en Completed y
+	 * su Call-ID): se deja de reenviar el error y se pasa a Terminated.</li>
+	 * <li>Con loose routing, el ACK del 200 de la llamada establecida, que trae
+	 * nuestra Route: se reenvia al llamado.</li>
+	 * </ul>
+	 * Cualquier otro se descarta: por ejemplo, el ACK de un 503, que no es de la
+	 * llamada en curso.
 	 */
-	private void onAckFromA(ACKMessage ack) {
+	private void onAck(ACKMessage ack) throws IOException {
 		if (stateA == InviteState.COMPLETED && ack.getCallId().equals(inviteCallId)) {
 			cancelTimer(retransmitTimerA);
 			setStateA(InviteState.TERMINATED);
 			tryEndInvite();
+		} else if (ack.getCallId().equals(callInProgressId) && userLayer.isMyRoute(ack.getRoute())) {
+			// El ACK del 200 siempre lo envia el llamante: va hacia B.
+			userLayer.forwardAck(ack, addressB, portB);
 		} else {
 			System.err.println("Unexpected message, throwing away");
 		}
+	}
+
+	/**
+	 * Loose routing: llega el BYE de la llamada establecida, con nuestra Route.
+	 * Se reenvia al otro extremo: si lo envia el llamante (su URI esta en el
+	 * From) va hacia B, y si lo envia el llamado, hacia A. El proxy sigue en la
+	 * llamada hasta ver el 200 OK; por si no llega nunca, arranca una espera de
+	 * 15 s. Sin loose routing el BYE no pasa por el proxy, asi que se descarta.
+	 */
+	private void onBye(ByeMessage bye) throws IOException {
+		if (!bye.getCallId().equals(callInProgressId) || !userLayer.isMyRoute(bye.getRoute())) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		if (bye.getFromUri().equals(callerUri)) {
+			userLayer.forwardBye(bye, addressB, portB);
+		} else {
+			userLayer.forwardBye(bye, addressA, portA);
+		}
+		startByeTimer();
+	}
+
+	/**
+	 * Loose routing: llega el 200 OK del BYE de la llamada establecida. Se
+	 * reenvia a quien colgo y la llamada termina: el proxy queda libre.
+	 */
+	private void onByeOk(OKMessage ok) throws IOException {
+		if (!ok.getCallId().equals(callInProgressId)) {
+			System.err.println("Unexpected message, throwing away");
+			return;
+		}
+		userLayer.forwardByeOk(ok);
+		endCall();
 	}
 
 	// =========================================================================
@@ -233,11 +311,19 @@ public class ProxyTransactionLayer {
 	}
 	/**
 	 * Envia una respuesta que no cambia el estado de ninguna transaccion: las
-	 * respuestas al REGISTER, las de B que se reenvian a A y el 503 a un
-	 * segundo INVITE.
+	 * respuestas al REGISTER, las de B que se reenvian a A, el 503 a un
+	 * segundo INVITE y, con loose routing, el 200 OK del BYE.
 	 */
 	public void sendResponse(SIPMessage response, String address, int port) throws IOException {
 		transportLayer.send(response, address, port);
+	}
+
+	/**
+	 * Loose routing: reenvia una peticion de la llamada establecida (el ACK del
+	 * 200 o el BYE). No tienen transaccion en el proxy.
+	 */
+	public void forwardRequest(SIPMessage request, String address, int port) throws IOException {
+		transportLayer.send(request, address, port);
 	}
 
 	// =========================================================================
@@ -380,7 +466,46 @@ public class ProxyTransactionLayer {
 		}
 	}
 
-	/** Fin del procesamiento del INVITE: se paran los temporizadores y el proxy queda libre para otra llamada. */
+	/**
+	 * Loose routing: espera el 200 OK del BYE que se acaba de reenviar. Si a los
+	 * 15 s no ha llegado (se ha perdido, o el otro UA esta cerrado), el proxy da
+	 * la llamada por terminada para no quedarse ocupado para siempre. Si llega
+	 * otro BYE mientras tanto, la espera no se reinicia.
+	 */
+	private void startByeTimer() {
+		if (byeTimer != null) {
+			return;
+		}
+		byeTimer = new Timer("proxy-bye", true);
+		byeTimer.schedule(new TimerTask() {
+			@Override
+			public void run() {
+				synchronized (ProxyTransactionLayer.this) {
+					if (callInProgressId == null) {
+						return; // el 200 OK ya habia llegado
+					}
+					System.out.println("[Proxy] Sin 200 OK del BYE en " + (BYE_MS / 1000)
+							+ " s: se da la llamada por terminada");
+					endCall();
+				}
+			}
+		}, BYE_MS);
+	}
+
+	/** Loose routing: fin de la llamada establecida. El proxy queda libre para otra. */
+	private void endCall() {
+		cancelTimer(byeTimer);
+		byeTimer = null;
+		callInProgressId = null;
+		callerUri = null;
+		System.out.println("[Proxy] Llamada terminada: proxy libre");
+	}
+
+	/**
+	 * Fin del procesamiento del INVITE: se paran los temporizadores. El proxy
+	 * queda libre para otra llamada, salvo que con loose routing se haya
+	 * establecido la llamada: entonces sigue en ella.
+	 */
 	private void endInvite() {
 		cancelTimer(completedTimerA);
 		cancelTimer(retransmitTimerA);
@@ -394,7 +519,12 @@ public class ProxyTransactionLayer {
 		stateB = InviteState.IDLE;
 		inviteCallId = null;
 		inviteToB = null;
-		System.out.println("[Proxy] Procesamiento del INVITE terminado: proxy libre");
+		if (callInProgressId == null) {
+			System.out.println("[Proxy] Procesamiento del INVITE terminado: proxy libre");
+		} else {
+			System.out.println("[Proxy] Procesamiento del INVITE terminado: el proxy sigue en la llamada"
+					+ " hasta el 200 OK del BYE");
+		}
 	}
 
 	private void cancelTimer(Timer timer) {
