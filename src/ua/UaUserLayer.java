@@ -182,18 +182,19 @@ public class UaUserLayer {
 			switch (callState) {
 				case IDLE:
 					System.out.println("INVITE usuario   (llamar, p. ej. INVITE bob)");
+					System.out.println("salir            (terminar el UA)");
 					break;
 				case OUTGOING:
 					System.out.println("Llamada saliente en curso: esperando respuesta");
 					break;
 				case INCOMING:
-					System.out.println("Llamada entrante de " + incomingInvite.getFromUri() + ": S para aceptar, N para rechazar");
+					System.out.println("Llamada entrante de " + incomingInvite.getFromUri() + ": S para aceptar, N para rechazar, salir para rechazar y terminar");
 					break;
 				case IN_CALL:
-					System.out.println("En llamada: BYE para colgar");
+					System.out.println("En llamada: BYE para colgar, salir para colgar y terminar el UA");
 					break;
 				case HANGING_UP:
-					System.out.println("Colgando: esperando el 200 OK del BYE");
+					System.out.println("Colgando: esperando el 200 OK del BYE (salir para terminar el UA)");
 					break;
 			}
 		}
@@ -202,20 +203,23 @@ public class UaUserLayer {
 
 	/**
 	 * Ejecuta un comando. Hasta que el UA esta registrado no se acepta ninguno.
-	 * Mientras suena una llamada entrante, solo valen S y N.
+	 * "salir" vale en cualquier estado de la llamada (ver commandExit()).
+	 * Mientras suena una llamada entrante, solo valen S, N y salir.
 	 */
 	private void command(String line) throws IOException {
 		if (!registered) {
 			System.out.println("Comando ignorado: el UA no esta registrado en el proxy");
 			return;
 		}
-		if (callState == CallState.INCOMING) {
+		if (line.equalsIgnoreCase("salir")) {
+			commandExit();
+		} else if (callState == CallState.INCOMING) {
 			if (line.equalsIgnoreCase("S")) {
 				acceptCall();
 			} else if (line.equalsIgnoreCase("N")) {
 				rejectCall();
 			} else {
-				System.out.println("Responde S (aceptar) o N (rechazar)");
+				System.out.println("Responde S (aceptar), N (rechazar) o salir");
 			}
 		} else if (line.toUpperCase().startsWith("INVITE")) {
 			commandInvite(line);
@@ -224,6 +228,39 @@ public class UaUserLayer {
 		} else {
 			System.out.println("Bad command");
 		}
+	}
+
+	/**
+	 * Comando "salir": termina el UA. Si la llamada esta establecida, antes envia
+	 * el BYE, pero no espera su 200 OK: el UA se cierra en el acto y ya no estara
+	 * para recibirlo. El otro extremo cuelga al recibir el BYE y, con loose
+	 * routing, el proxy queda libre al ver pasar ese 200 OK. Si esta sonando una
+	 * llamada entrante, se rechaza como con N. Mientras esperamos la respuesta a
+	 * nuestro INVITE, o el ACK de una llamada que hemos aceptado, no se puede
+	 * salir: el enunciado no tiene CANCEL, y el otro UA y el proxy se quedarian
+	 * con una llamada a medias.
+	 */
+	private void commandExit() throws IOException {
+		switch (callState) {
+			case OUTGOING:
+				System.out.println("No se puede salir con una llamada saliente en curso: espera la respuesta");
+				return;
+			case INCOMING:
+				rejectCall();
+				break;
+			case IN_CALL:
+				if (!callConfirmed) {
+					System.out.println("No se puede salir hasta que llegue el ACK de la llamada");
+					return;
+				}
+				commandBye();
+				break;
+			default:
+				// IDLE: no hay llamada. HANGING_UP: el BYE ya salio.
+				break;
+		}
+		System.out.println("Finalizando el UA");
+		System.exit(0);
 	}
 
 	// =========================================================================
