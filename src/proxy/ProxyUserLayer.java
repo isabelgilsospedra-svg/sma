@@ -1,13 +1,26 @@
 package proxy;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
 import common.FindMyIPv4;
-import mensajesSIP.*;
+import mensajesSIP.ACKMessage;
+import mensajesSIP.ByeMessage;
+import mensajesSIP.InviteMessage;
+import mensajesSIP.NotFoundMessage;
+import mensajesSIP.OKMessage;
+import mensajesSIP.RegisterMessage;
+import mensajesSIP.RequestTimeoutMessage;
+import mensajesSIP.SIPMessage;
+import mensajesSIP.ServiceUnavailableMessage;
+import mensajesSIP.TryingMessage;
 import sipServlet.ServletClass;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
-
-import java.io.IOException;
-import java.util.*;
 
 /**
  * Capa de usuario del Proxy.
@@ -32,14 +45,12 @@ public class ProxyUserLayer {
 	private final String myRoute;
 	/** Usuarios que pueden registrarse (las URIs de users.xml), por ejemplo "sip:alice@SMA". */
 	private final Set<String> allowedUsers = new HashSet<String>();
-
 	/**
 	 * Clase de servlet de cada usuario que tiene una en users.xml: URI del
 	 * usuario y nombre completo de la clase, por ejemplo "sip:dave@SMA" y
 	 * "example.sip.HorarioSIPServlet". Los usuarios sin servlet no aparecen.
 	 */
 	private final Map<String, String> servletClasses = new HashMap<String, String>();
-
 	/** Tabla de registros: URI del usuario, donde esta y hasta cuando. */
 	private final Map<String, Registration> registry = new HashMap<String, Registration>();
 
