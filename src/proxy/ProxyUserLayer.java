@@ -1,25 +1,13 @@
 package proxy;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-
 import common.FindMyIPv4;
-import mensajesSIP.ACKMessage;
-import mensajesSIP.ByeMessage;
-import mensajesSIP.InviteMessage;
-import mensajesSIP.NotFoundMessage;
-import mensajesSIP.OKMessage;
-import mensajesSIP.RegisterMessage;
-import mensajesSIP.RequestTimeoutMessage;
-import mensajesSIP.SIPMessage;
-import mensajesSIP.ServiceUnavailableMessage;
-import mensajesSIP.TryingMessage;
+import mensajesSIP.*;
+import sipServlet.ServletClass;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
+
+import java.io.IOException;
+import java.util.*;
 
 /**
  * Capa de usuario del Proxy.
@@ -44,6 +32,14 @@ public class ProxyUserLayer {
 	private final String myRoute;
 	/** Usuarios que pueden registrarse (las URIs de users.xml), por ejemplo "sip:alice@SMA". */
 	private final Set<String> allowedUsers = new HashSet<String>();
+
+	/**
+	 * Clase de servlet de cada usuario que tiene una en users.xml: URI del
+	 * usuario y nombre completo de la clase, por ejemplo "sip:dave@SMA" y
+	 * "example.sip.HorarioSIPServlet". Los usuarios sin servlet no aparecen.
+	 */
+	private final Map<String, String> servletClasses = new HashMap<String, String>();
+
 	/** Tabla de registros: URI del usuario, donde esta y hasta cuando. */
 	private final Map<String, Registration> registry = new HashMap<String, Registration>();
 
@@ -71,12 +67,22 @@ public class ProxyUserLayer {
 		transactionLayer.startListening();
 	}
 
-	/** Lee users.xml y se queda con las URIs de los usuarios permitidos. */
+	/**
+	 * Lee users.xml: se queda con las URIs de los usuarios permitidos y, de los
+	 * que tienen un elemento Servlet-class, con el nombre de su clase de servlet.
+	 * La clase no se carga aqui: se carga con cada INVITE, al elegir el servlet
+	 * de la llamada.
+	 */
 	private void loadAllowedUsers() throws Exception {
 		for (User user : UsersServletReader.readUsers().getListUsers()) {
 			allowedUsers.add(user.getId());
+			ServletClass servletClass = user.getServletClass();
+			if (servletClass != null && servletClass.getName() != null) {
+				servletClasses.put(user.getId(), servletClass.getName());
+			}
 		}
 		System.out.println("Usuarios permitidos: " + allowedUsers);
+		System.out.println("Servlets: " + servletClasses);
 	}
 
 	// =========================================================================

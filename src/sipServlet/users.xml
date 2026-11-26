@@ -8,4 +8,11 @@
 	<user id="sip:alice@SMA" />
 	<user id="sip:bob@SMA" />
 	<user id="sip:carol@SMA" />
+	<user id="sip:boss@SMA" />
+	<user id="sip:dave@SMA">
+		<Servlet-class name="example.sip.HorarioSIPServlet" />
+	</user>
+	<user id="sip:erin@SMA">
+		<Servlet-class name="example.sip.DesvioSIPServlet" />
+	</user>
 </users>
