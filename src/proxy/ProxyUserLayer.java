@@ -9,6 +9,7 @@ import java.util.Set;
 
 import common.FindMyIPv4;
 import mensajesSIP.ACKMessage;
+import mensajesSIP.BusyHereMessage;
 import mensajesSIP.ByeMessage;
 import mensajesSIP.InviteMessage;
 import mensajesSIP.NotFoundMessage;
@@ -18,6 +19,7 @@ import mensajesSIP.RequestTimeoutMessage;
 import mensajesSIP.SIPMessage;
 import mensajesSIP.ServiceUnavailableMessage;
 import mensajesSIP.TryingMessage;
+import sipServlet.SIPServletInterface;
 import sipServlet.ServletClass;
 import sipServlet.User;
 import sipServlet.UsersServletReader;
@@ -29,6 +31,9 @@ import sipServlet.UsersServletReader;
  * de users.xml), donde esta cada usuario registrado, si un INVITE se acepta o
  * se rechaza y por donde vuelven las respuestas. Los estados de las
  * transacciones los lleva la capa de transaccion.
+ *
+ * Tambien es el contenedor de servlets SIP: con cada INVITE nuevo ejecuta el
+ * servlet del llamado (o, si no tiene, el del llamante) y aplica lo que decida.
  */
 public class ProxyUserLayer {
 	private final ProxyTransactionLayer transactionLayer;
@@ -145,50 +150,113 @@ public class ProxyUserLayer {
 	// =========================================================================
 
 	/**
-	 * Llega un INVITE de A para B con el proxy libre.
+	 * Llega un INVITE de una llamada nueva con el proxy libre (si estaba ocupado
+	 * ya se ha respondido 503 sin llegar aqui). Con Max-Forwards a 0 se descarta.
 	 *
-	 * Si A o B no estan registrados (o su registro ha caducado), se responde
-	 * 404. Si los dos lo estan, se responde 100 Trying a A y el INVITE se
-	 * reenvia a B con nuestra Via puesta delante y Max-Forwards uno menos. Con
-	 * loose routing se le anade ademas nuestro Record-Route, para que el ACK del
-	 * 200 y el BYE pasen por el proxy.
+	 * Si el llamado tiene servlet, o si no lo tiene pero el llamante si, decide
+	 * ese servlet: rechazar la llamada o dejarla seguir hacia una URI. Solo se
+	 * ejecuta uno por llamada. Sin servlet la llamada sigue hacia el llamado,
+	 * como sin servlets.
 	 */
 	public void onInviteReceived(InviteMessage inviteMessage) throws IOException {
 		String caller = inviteMessage.getFromUri();
 		String callee = inviteMessage.getToUri();
 
-		// La respuesta a A vuelve por donde vino el INVITE: su primera Via.
-		String[] origin = inviteMessage.getVias().get(0).split(":");
-		String addressA = origin[0];
-		int portA = Integer.parseInt(origin[1]);
-
 		// Con Max-Forwards a 0 el INVITE se descarta sin responder, como si se
 		// hubiera perdido: el enunciado no incluye ninguna respuesta para este caso.
-		int maxForwards = inviteMessage.getMaxForwards();
-		if (maxForwards <= 0) {
+		if (inviteMessage.getMaxForwards() <= 0) {
 			System.out.println("INVITE de " + caller + " descartado: Max-Forwards = 0");
 			return;
 		}
 
-		Registration registrationA = activeRegistration(caller);
-		Registration registrationB = activeRegistration(callee);
-		if (registrationA == null || registrationB == null) {
-			String missing = (registrationA == null) ? caller : callee;
-			System.out.println("INVITE de " + caller + " a " + callee + " rechazado: " + missing + " no esta registrado");
-			transactionLayer.rejectInvite(inviteMessage.getCallId(), buildNotFound(inviteMessage), addressA, portA);
+		SIPServletInterface servlet = loadServlet(callee);
+		if (servlet == null) {
+			servlet = loadServlet(caller);
+		}
+		if (servlet == null) {
+			proceedInvite(inviteMessage, callee);
 			return;
 		}
 
+		// El servlet no envia nada: apunta su decision en el request y el proxy la
+		// aplica cuando doInvite termina.
+		SipServletRequest request = new SipServletRequest(caller, callee);
+		try {
+			servlet.doInvite(request);
+		} catch (RuntimeException e) {
+			System.out.println("[Proxy] El servlet ha fallado (" + e + "): se responde 503");
+			respondError(inviteMessage, 503);
+			return;
+		}
+		if (request.getTargetUri() != null) {
+			System.out.println("[Proxy] El servlet deja seguir la llamada hacia " + request.getTargetUri());
+			proceedInvite(inviteMessage, request.getTargetUri());
+		} else if (request.getResponseCode() != 0) {
+			int code = request.getResponseCode();
+			if (isServletErrorCode(code)) {
+				System.out.println("[Proxy] El servlet rechaza la llamada con " + code);
+				respondError(inviteMessage, code);
+			} else {
+				System.out.println("[Proxy] El servlet pide la respuesta " + code
+						+ ", que no es 404, 408, 486 ni 503: se responde 503");
+				respondError(inviteMessage, 503);
+			}
+		} else {
+			System.out.println("[Proxy] El servlet no ha decidido nada: se responde 503");
+			respondError(inviteMessage, 503);
+		}
+	}
+
+	/**
+	 * La llamada sigue hacia target: el llamado o la URI que ha elegido el
+	 * servlet. Si el llamante o target no estan registrados (o su registro ha
+	 * caducado), se responde 404. Si los dos lo estan, se responde 100 Trying a A
+	 * y el INVITE se reenvia a target con nuestra Via puesta delante y
+	 * Max-Forwards uno menos. Con loose routing se le anade ademas nuestro
+	 * Record-Route, para que el ACK del 200 y el BYE pasen por el proxy.
+	 *
+	 * Si target no es el llamado (un desvio), cambia la primera linea del INVITE
+	 * (la Request-URI) pero no el To: un proxy SIP no modifica el To.
+	 */
+	private void proceedInvite(InviteMessage inviteMessage, String target) throws IOException {
+		String caller = inviteMessage.getFromUri();
+		Registration registrationA = activeRegistration(caller);
+		Registration registrationB = activeRegistration(target);
+		if (registrationA == null || registrationB == null) {
+			String missing = (registrationA == null) ? caller : target;
+			System.out.println("INVITE de " + caller + " a " + target + " rechazado: " + missing + " no esta registrado");
+			respondError(inviteMessage, 404);
+			return;
+		}
+
+		// La respuesta a A vuelve por donde vino el INVITE: su primera Via.
+		String[] origin = inviteMessage.getVias().get(0).split(":");
 		// El 100 se construye antes de tocar las Vias: debe llevar solo las que traia el INVITE.
-		transactionLayer.acceptInvite(inviteMessage.getCallId(), buildTrying(inviteMessage), addressA, portA);
+		transactionLayer.acceptInvite(inviteMessage.getCallId(), buildTrying(inviteMessage), origin[0],
+				Integer.parseInt(origin[1]));
 
 		inviteMessage.addVia(myVia);
-		inviteMessage.setMaxForwards(maxForwards - 1);
+		inviteMessage.setMaxForwards(inviteMessage.getMaxForwards() - 1);
 		if (looseRouting) {
 			inviteMessage.setRecordRoute(myRoute);
 		}
+		if (!target.equals(inviteMessage.getToUri())) {
+			inviteMessage.setDestination(target);
+		}
 		String[] contactB = registrationB.contact.split(":");
 		transactionLayer.forwardInvite(inviteMessage, contactB[0], Integer.parseInt(contactB[1]));
+	}
+
+	/**
+	 * Rechaza el INVITE, antes del 100 Trying, con la respuesta de error code
+	 * (404, 408, 486 o 503). La transaccion con A pasa a Completed y reenvia el
+	 * error hasta recibir el ACK de A, como cualquier otro error del proxy.
+	 */
+	private void respondError(InviteMessage inviteMessage, int code) throws IOException {
+		// La respuesta a A vuelve por donde vino el INVITE: su primera Via.
+		String[] origin = inviteMessage.getVias().get(0).split(":");
+		transactionLayer.rejectInvite(inviteMessage.getCallId(), buildError(inviteMessage, code), origin[0],
+				Integer.parseInt(origin[1]));
 	}
 
 	/**
@@ -279,6 +347,48 @@ public class ProxyUserLayer {
 	}
 
 	// =========================================================================
+	// Servlets
+	// =========================================================================
+
+	/**
+	 * Carga el servlet de un usuario: busca su clase en users.xml, la carga por su
+	 * nombre con Class.forName y crea un objeto nuevo para esta llamada. Si el
+	 * usuario no tiene servlet devuelve null. Si la clase no existe, no se puede
+	 * crear o no implementa SIPServletInterface, se avisa y tambien devuelve null:
+	 * para el proxy es como si ese usuario no tuviera servlet.
+	 *
+	 * @param uri URI del usuario, por ejemplo "sip:dave@SMA"
+	 * @return el servlet listo para doInvite, o null
+	 */
+	private SIPServletInterface loadServlet(String uri) {
+		String className = servletClasses.get(uri);
+		if (className == null) {
+			return null;
+		}
+		try {
+			Object instance = Class.forName(className).getDeclaredConstructor().newInstance();
+			if (instance instanceof SIPServletInterface) {
+				System.out.println("[Proxy] Se ejecuta el servlet de " + uri + " (" + className + ")");
+				return (SIPServletInterface) instance;
+			}
+			System.out.println("[Proxy] " + className + " no implementa SIPServletInterface: " + uri
+					+ " se trata como sin servlet");
+		} catch (ReflectiveOperationException | LinkageError e) {
+			System.out.println("[Proxy] No se puede cargar el servlet " + className + " (" + e + "): " + uri
+					+ " se trata como sin servlet");
+		}
+		return null;
+	}
+
+	/**
+	 * Codigos con los que un servlet puede rechazar una llamada: las respuestas de
+	 * error que define el proyecto.
+	 */
+	private static boolean isServletErrorCode(int code) {
+		return code == 404 || code == 408 || code == 486 || code == 503;
+	}
+
+	// =========================================================================
 	// Construccion de respuestas
 	// =========================================================================
 	//
@@ -343,6 +453,50 @@ public class ProxyUserLayer {
 		nf.setContact(invite.getContact());
 		nf.setContentLength(0);
 		return nf;
+	}
+
+	/** Respuesta de error code a un INVITE tal como lo envio A (sin nuestra Via). */
+	private SIPMessage buildError(InviteMessage invite, int code) {
+		switch (code) {
+			case 404:
+				return buildNotFound(invite);
+			case 408:
+				return buildRequestTimeoutForA(invite);
+			case 486:
+				return buildBusyHere(invite);
+			default:
+				return buildServiceUnavailable(invite);
+		}
+	}
+
+	/** 408 a un INVITE tal como lo envio A, cuando lo pide un servlet. */
+	private RequestTimeoutMessage buildRequestTimeoutForA(InviteMessage invite) {
+		RequestTimeoutMessage timeout = new RequestTimeoutMessage();
+		timeout.setVias(new ArrayList<String>(invite.getVias()));
+		timeout.setToName(invite.getToName());
+		timeout.setToUri(invite.getToUri());
+		timeout.setFromName(invite.getFromName());
+		timeout.setFromUri(invite.getFromUri());
+		timeout.setCallId(invite.getCallId());
+		timeout.setcSeqNumber(invite.getcSeqNumber());
+		timeout.setcSeqStr(invite.getcSeqStr());
+		timeout.setContentLength(0);
+		return timeout;
+	}
+
+	/** 486 a un INVITE tal como lo envio A, cuando lo pide un servlet. */
+	private BusyHereMessage buildBusyHere(InviteMessage invite) {
+		BusyHereMessage busy = new BusyHereMessage();
+		busy.setVias(new ArrayList<String>(invite.getVias()));
+		busy.setToName(invite.getToName());
+		busy.setToUri(invite.getToUri());
+		busy.setFromName(invite.getFromName());
+		busy.setFromUri(invite.getFromUri());
+		busy.setCallId(invite.getCallId());
+		busy.setcSeqNumber(invite.getcSeqNumber());
+		busy.setcSeqStr(invite.getcSeqStr());
+		busy.setContentLength(0);
+		return busy;
 	}
 
 	/**

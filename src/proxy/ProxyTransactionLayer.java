@@ -276,9 +276,10 @@ public class ProxyTransactionLayer {
 	}
 
 	/**
-	 * Transaccion con A: el INVITE se rechaza con un 404. Se pasa a Proceeding,
-	 * se envia el error y se entra en Completed: se reenvia cada 200 ms hasta el
-	 * ACK de A, y a 1 s se pasa a Terminated.
+	 * Transaccion con A: el INVITE se rechaza antes del 100 Trying, con un 404 o
+	 * con el error que decide un servlet. Se pasa a Proceeding, se envia el error
+	 * y se entra en Completed: se reenvia cada 200 ms hasta el ACK de A, y a 1 s
+	 * se pasa a Terminated.
 	 */
 	public synchronized void rejectInvite(String callId, SIPMessage error, String addressA, int portA)
 			throws IOException {
@@ -286,10 +287,10 @@ public class ProxyTransactionLayer {
 		this.addressA = addressA;
 		this.portA = portA;
 		setStateA(InviteState.PROCEEDING);
-		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el primer envio del 404
-		// a A no sale.
+		// PRUEBA DE PERDIDA: si se comenta la linea siguiente, el primer envio del error
+		// (404, o el que decida un servlet) a A no sale.
 		// Que se ve: a los 200 ms aparece "[Proxy] Sin ACK de A: se reenvia la respuesta
-		// de error", el 404 llega a A con ese reenvio y A responde con su ACK.
+		// de error", el error llega a A con ese reenvio y A responde con su ACK.
 		transportLayer.send(error, addressA, portA);
 		enterCompletedA(error);
 	}
